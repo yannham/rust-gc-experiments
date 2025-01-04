@@ -1,21 +1,55 @@
 use std::alloc::{alloc, Layout};
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::mem::align_of;
 use std::ptr::{self, NonNull};
 
 pub struct Heap {
     start: NonNull<u8>,
     current: Cell<NonNull<u8>>,
+    roots: RefCell<Vec<NonNull<BlockHeader>>>,
     size: usize,
 }
+
+const MARK_BIT_MASK: usize = 1 << 63;
 
 pub struct BlockHeader {
     // Size in bytes of the allocated chunk. The most significant bit holds the mark and sweep
     // flag.
     size: usize,
+    // The padding between the header and the beginning of the object.
+    padding: usize,
+    // Pointer to the callback function that traces the object.
+    tracer: fn(*const u8),
 }
 
-trait Trace {}
+impl BlockHeader {
+    pub fn mark(&mut self) {
+        self.size = self.size | MARK_BIT_MASK;
+    }
+
+    pub fn unmark(&mut self) {
+        self.size = self.size & !MARK_BIT_MASK;
+    }
+
+    pub fn is_marked(&self) -> bool {
+        self.size & MARK_BIT_MASK != 0
+    }
+
+    pub fn trace(&self) {
+        let value = unsafe {
+            (ptr::from_ref(self) as *const u8).add(size_of::<BlockHeader>() + self.padding)
+        };
+        (self.tracer)(value)
+    }
+}
+
+pub trait Trace {
+    fn trace(&self) {}
+}
+
+impl Trace for usize {}
+impl Trace for String {}
+impl Trace for i32 {}
 
 impl Heap {
     pub fn new(size: usize) -> Self {
@@ -38,16 +72,26 @@ impl Heap {
             Self {
                 start,
                 current: Cell::new(start),
+                roots: RefCell::new(Vec::new()),
                 size,
             }
         }
     }
 
     pub fn collect(&self) {
-        panic!("out of heap memory (collect is unimplemented)");
+        self.trace();
+        self.sweep();
     }
 
-    pub fn alloc<T>(&self, value: T) -> &mut T {
+    pub fn alloc_root<T: Trace>(&self, value: T) -> &mut T {
+        self.alloc_impl(value, true)
+    }
+
+    pub fn alloc<T: Trace>(&self, value: T) -> &mut T {
+        self.alloc_impl(value, false)
+    }
+
+    fn alloc_impl<T: Trace>(&self, value: T, root: bool) -> &mut T {
         let layout = Layout::new::<T>();
         let current = self.current.get().as_ptr();
 
@@ -73,6 +117,13 @@ impl Heap {
             // We use the following invariant of the heap: `current` is always
             // `BlockHeader`-aligned
             let header_ptr = current as *mut BlockHeader;
+
+            if root {
+                self.roots
+                    .borrow_mut()
+                    // Safety: header_ptr is coming from `current`, which is NonNull
+                    .push(NonNull::new_unchecked(header_ptr));
+            }
 
             // Advance the current pointer to the next free address.
 
@@ -107,6 +158,8 @@ impl Heap {
                 header_ptr,
                 BlockHeader {
                     size: (next_slot as usize) - (unaligned_slot as usize),
+                    padding: (slot as usize) - (unaligned_slot as usize),
+                    tracer: |obj| T::trace(&*(obj as *const T)),
                 },
             );
 
@@ -133,6 +186,38 @@ impl Heap {
             }
         }
     }
+
+    fn trace(&self) {
+        for root in self.roots.borrow().iter() {
+            let header = unsafe { &mut *(root.as_ptr() as *mut BlockHeader) };
+            debug_assert!(
+                !header.is_marked(),
+                "roots should always be unmarked at the beginning of the tracing phase"
+            );
+            header.mark();
+            header.trace();
+        }
+    }
+
+    pub fn sweep(&self) {
+        let mut ptr = self.start.as_ptr();
+        let end = self.current.get().as_ptr();
+
+        unsafe {
+            while ptr < end {
+                let header = &mut *(ptr as *mut BlockHeader);
+                if header.is_marked() {
+                    println!("Object {ptr:p} is marked. Keeping and unmarking");
+                    header.unmark();
+                } else {
+                    println!("Object {ptr:p} is unmarked. Sweeping (in principle, currently unimplemented)");
+                }
+
+                println!("Next object: {} bytes (header @ {ptr:p})", header.size);
+                ptr = ptr.wrapping_add(header.size + size_of::<BlockHeader>());
+            }
+        }
+    }
 }
 
 /// Unsafety: the preconditions to avoid Undefined Behavior are the same as for `std::ptr::add`.
@@ -147,4 +232,14 @@ unsafe fn align_up(ptr: *mut u8, align: usize) -> *mut u8 {
     // 3. Offset he ptr by this value
     let offset = ((!(ptr as usize) & (align - 1)) + 1) & (align - 1);
     ptr.add(offset)
+}
+
+/// Unsafety: the preconditions to avoid Undefined Behavior are the same as for `std::ptr::add`.
+/// This methods keeps the address provenance information.
+///
+/// Requires that `align` is a power of 2.
+
+unsafe fn align_down(ptr: *mut u8, align: usize) -> *mut u8 {
+    let offset = (ptr as usize) & (align - 1);
+    ptr.sub(offset)
 }
