@@ -27,7 +27,7 @@ struct BlockHeader {
     /// The padding between the header and the beginning of the object.
     padding: usize,
     /// Pointer to the callback function that traces the object.
-    tracer: fn(*const u8),
+    tracer: fn(*const u8, &mut Vec<GcPtr>),
 }
 
 impl BlockHeader {
@@ -49,20 +49,43 @@ impl BlockHeader {
     }
 
     pub fn trace(&self) {
-        let value = unsafe {
-            (ptr::from_ref(self) as *const u8).add(size_of::<BlockHeader>() + self.padding)
-        };
-        (self.tracer)(value)
+        let mut stack = vec![GcPtr {
+            start: NonNull::new(ptr::from_ref(self) as *mut BlockHeader).unwrap(),
+        }];
+
+        while let Some(gc) = stack.pop() {
+            let value = unsafe {
+                (gc.start.as_ptr() as *const u8).add(size_of::<BlockHeader>() + self.padding)
+            };
+            let header = unsafe { &*(gc.start.as_ptr()) };
+
+            if header.is_marked() {
+                continue;
+            }
+
+            header.mark();
+            
+            (header.tracer)(value, &mut stack);
+        }
     }
 }
 
 pub struct Gc<T> {
-    data: NonNull<T>,
+    start: NonNull<BlockHeader>,
+    _marker: std::marker::PhantomData<T>,
+}
+
+#[derive(Clone, Copy)]
+pub struct GcPtr {
+    start: NonNull<BlockHeader>,
 }
 
 impl<T> Clone for Gc<T> {
     fn clone(&self) -> Self {
-        Self { data: self.data }
+        Self {
+            start: self.start,
+            _marker: std::marker::PhantomData,
+        }
     }
 }
 
@@ -72,18 +95,23 @@ impl<T> Deref for Gc<T> {
     type Target = T;
 
     fn deref(&self) -> &T {
-        unsafe { self.data.as_ref() }
+        unsafe {
+            let header = &*self.start.as_ptr();
+            let value =
+                (self.start.as_ptr() as *const u8).add(size_of::<BlockHeader>() + header.padding);
+            &*(value as *const T)
+        }
     }
 }
 
 impl<T: fmt::Debug> fmt::Debug for Gc<T> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "Gc({:?})", self.data)
+        write!(f, "Gc({:?})", self.deref())
     }
 }
 
 pub trait Trace {
-    fn trace(&self) {}
+    fn trace(&self, _stack: &mut Vec<GcPtr>) {}
 }
 
 impl Trace for usize {}
@@ -123,18 +151,14 @@ impl Heap {
     }
 
     pub fn alloc_root<T: Trace>(&self, value: T) -> Gc<T> {
-        Gc {
-            data: self.alloc_impl(value, true).into(),
-        }
+        self.alloc_impl(value, true)
     }
 
     pub fn alloc<T: Trace>(&self, value: T) -> Gc<T> {
-        Gc {
-            data: self.alloc_impl(value, false).into(),
-        }
+        self.alloc_impl(value, false)
     }
 
-    fn alloc_impl<T: Trace>(&self, value: T, root: bool) -> &mut T {
+    fn alloc_impl<T: Trace>(&self, value: T, root: bool) -> Gc<T> {
         let layout = Layout::new::<T>();
         let current = self.current.get().as_ptr();
 
@@ -202,7 +226,7 @@ impl Heap {
                 BlockHeader {
                     size: (next_slot as usize) - (unaligned_slot as usize),
                     padding: (slot as usize) - (unaligned_slot as usize),
-                    tracer: |obj| T::trace(&*(obj as *const T)),
+                    tracer: |obj, stack| T::trace(&*(obj as *const T), stack),
                 },
             );
 
@@ -213,7 +237,10 @@ impl Heap {
             // aligned thanks to the call to `align_up`.
             ptr::write(slot, value);
 
-            &mut *slot
+            Gc {
+                start: NonNull::new_unchecked(header_ptr),
+                _marker: std::marker::PhantomData,
+            }
         }
     }
 
