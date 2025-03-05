@@ -1,6 +1,4 @@
-mod lib;
-
-use bump_alloc::{Gc, Heap, Trace};
+use bump_alloc::{Gc, GcPtr, Heap, Trace};
 
 #[derive(Debug)]
 struct Baz {
@@ -17,15 +15,15 @@ struct Foo {
 }
 
 impl Trace for Baz {
-    fn trace(&self) {
-        println!("Tracing baz");
+    fn trace(&self, _stack: &mut Vec<GcPtr>) {
+        eprintln!("Tracing baz");
     }
 }
 
 impl Trace for Foo {
-    fn trace(&self) {
-        println!("Tracing foo");
-        self.thd.trace();
+    fn trace(&self, stack: &mut Vec<GcPtr>) {
+        eprintln!("Tracing foo");
+        stack.push(self.thd.as_gc_ptr());
     }
 }
 
@@ -52,10 +50,15 @@ fn main() {
         thd: baz_deps,
     });
 
-    println!("Some operation {}", baz.fst + *foo + (baz.thd[0] as usize));
+    println!(
+        "Some operation {}",
+        baz.fst + *foo + (baz.thd[0] as usize) + foo_struct.snd.len() + (baz_deps.thd[2] as usize)
+    );
 
     println!("Alloced {foo:?}, {bar:?}, {baz:?}, {baz_deps:?} and {foo_struct:?}");
 
+    eprintln!("First collection");
     heap.collect();
+    eprintln!("Second collection");
     heap.collect();
 }

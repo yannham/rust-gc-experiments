@@ -7,9 +7,11 @@ use std::ptr::{self, NonNull};
 
 /// The garbage-collected heap.
 pub struct Heap {
+    /// Pointer to the start of the heap. This address is always `BlockHeader`-aligned.
     start: NonNull<u8>,
     /// Pointer to the next free address in the heap. This address is always `BlockHeader`-aligned.
     current: Cell<NonNull<u8>>,
+    /// The current roots that the garbage collector traces.
     roots: RefCell<Vec<NonNull<BlockHeader>>>,
     size: usize,
 }
@@ -19,20 +21,37 @@ const MARK_BIT_MASK: usize = 1 << 63;
 /// The header of a heap-allocated value.
 struct BlockHeader {
     /// Size in bytes of the allocated chunk, including the padding at the end of this header and
-    /// before the content, and including the padding at the end of the content (so that the next
-    /// entry is `BlockHeader`-aligned). Doesn't include the size of the header itself.
+    /// before the content and the padding at the end of the content (so that the next entry is
+    /// `BlockHeader`-aligned). Doesn't include the size of the header itself.
+    ///
+    /// That is, in the following diagram:
+    ///
+    /// ```text
+    /// +-------------+-----------+---------+-----------+
+    /// | BlockHeader | Padding   | Content | Padding   |
+    /// +-------------+-----------+---------+-----------+
+    /// ^             ^           ^         ^           ^
+    /// |             |           |         |           |
+    /// (a) start     (b) padding (c) value (d) padding (e) next
+    ///
+    /// `size` is `e - b` when interpreted as memory addresses.
     ///
     /// The most significant bit holds the mark and sweep flag.
     size: usize,
-    /// The padding between the header and the beginning of the object.
+    /// The padding between the header and the beginning of the object ((b) in the diagram
+    /// describing [Self::size]).
     padding: usize,
     /// Pointer to the callback function that traces the object.
     tracer: fn(*const u8, &mut Vec<GcPtr>),
 }
 
 impl BlockHeader {
-    pub fn mark(&mut self) {
+    /// Marks the block as reachable. Returns the previous state of the mark bit (`true` if the
+    /// block was already marked).
+    pub fn mark(&mut self) -> bool {
+        let was_marked = self.is_marked();
         self.size = self.size | MARK_BIT_MASK;
+        was_marked
     }
 
     pub fn unmark(&mut self) {
@@ -54,17 +73,17 @@ impl BlockHeader {
         }];
 
         while let Some(gc) = stack.pop() {
+            eprintln!("Trace loop: popping");
+
             let value = unsafe {
                 (gc.start.as_ptr() as *const u8).add(size_of::<BlockHeader>() + self.padding)
             };
-            let header = unsafe { &*(gc.start.as_ptr()) };
+            let header = unsafe { &mut *(gc.start.as_ptr()) };
 
-            if header.is_marked() {
+            if header.mark() {
                 continue;
             }
 
-            header.mark();
-            
             (header.tracer)(value, &mut stack);
         }
     }
@@ -78,6 +97,18 @@ pub struct Gc<T> {
 #[derive(Clone, Copy)]
 pub struct GcPtr {
     start: NonNull<BlockHeader>,
+}
+
+impl<T> Gc<T> {
+    pub fn as_gc_ptr(&self) -> GcPtr {
+        GcPtr { start: self.start }
+    }
+}
+
+impl<T> From<&Gc<T>> for GcPtr {
+    fn from(gc: &Gc<T>) -> Self {
+        gc.as_gc_ptr()
+    }
 }
 
 impl<T> Clone for Gc<T> {
@@ -259,12 +290,13 @@ impl Heap {
 
     fn trace(&self) {
         for root in self.roots.borrow().iter() {
+            eprintln!("Tracing root {root:p}");
+
             let header = unsafe { &mut *(root.as_ptr() as *mut BlockHeader) };
             debug_assert!(
                 !header.is_marked(),
                 "roots should always be unmarked at the beginning of the tracing phase"
             );
-            header.mark();
             header.trace();
         }
     }
