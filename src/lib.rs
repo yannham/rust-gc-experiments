@@ -4,15 +4,24 @@ use std::fmt;
 use std::mem::align_of;
 use std::ops::Deref;
 use std::ptr::{self, NonNull};
+use std::rc::Rc;
 
 /// The garbage-collected heap.
 pub struct Heap {
-    /// Pointer to the start of the heap. This address is always `BlockHeader`-aligned.
-    start: NonNull<u8>,
-    /// Pointer to the next free address in the heap. This address is always `BlockHeader`-aligned.
-    current: Cell<NonNull<u8>>,
+    /// The space for allocating new objects.
+    young_space: HeapSpace,
+    /// The space for evacuating objets that survived a young collection.
+    old_space: HeapSpace,
     /// The current roots that the garbage collector traces.
     roots: RefCell<Vec<NonNull<BlockHeader>>>,
+}
+
+/// A heap space, a bump-allocated contiguous area.
+pub struct HeapSpace {
+    /// Pointer to the start of the young generation. This address is always `BlockHeader`-aligned.
+    start: NonNull<u8>,
+    /// Pointer to the next free address in the young generation. This address is always `BlockHeader`-aligned.
+    current: Cell<NonNull<u8>>,
     size: usize,
 }
 
@@ -65,6 +74,30 @@ impl BlockHeader {
     }
 
     pub fn trace(&self) {
+        let mut stack = vec![GcPtr {
+            start: NonNull::new(ptr::from_ref(self) as *mut BlockHeader).unwrap(),
+        }];
+
+        while let Some(gc) = stack.pop() {
+            eprintln!("Trace loop: popping");
+
+            let value = unsafe {
+                (gc.start.as_ptr() as *const u8).add(size_of::<BlockHeader>() + self.padding)
+            };
+            let header = unsafe { &mut *(gc.start.as_ptr()) };
+
+            if header.is_marked() {
+                continue;
+            }
+
+            header.mark();
+            (header.tracer)(value, &mut stack);
+        }
+    }
+
+    pub fn evacuate(&self) {
+        todo!();
+
         let mut stack = vec![GcPtr {
             start: NonNull::new(ptr::from_ref(self) as *mut BlockHeader).unwrap(),
         }];
@@ -148,10 +181,98 @@ impl Trace for String {}
 impl Trace for i32 {}
 
 impl Heap {
+    pub fn new(young_size: usize, old_size: usize) -> Self {
+        Self {
+            young_space: HeapSpace::new(young_size),
+            old_space: HeapSpace::new(old_size),
+            roots: RefCell::new(Vec::new()),
+        }
+    }
+
+    pub fn alloc_root<T: Trace>(&self, value: T) -> Gc<T> {
+        let gced = self.alloc(value);
+        self.root(&gced);
+
+        gced
+    }
+
+    fn alloc<T: Trace>(&self, value: T) -> Gc<T> {
+        if self.young_space.can_alloc::<T>() {
+            self.young_space.alloc(value)
+        } else {
+            self.collect();
+            self.young_space.alloc(value)
+        }
+    }
+
+    pub fn root<T: Trace>(&self, managed: &Gc<T>) {
+        self.roots
+            .borrow_mut()
+            // Safety: `header_ptr` is coming from `current`, which is NonNull
+            .push(managed.start);
+    }
+
+    fn trace(&self) {
+        for root in self.roots.borrow().iter() {
+            eprintln!("Tracing root {root:p}");
+
+            let header = unsafe { &mut *(root.as_ptr() as *mut BlockHeader) };
+            debug_assert!(
+                !header.is_marked(),
+                "roots should always be unmarked at the beginning of the tracing phase"
+            );
+            header.trace();
+        }
+    }
+
+    //   pub fn sweep(&self) {
+    //       let mut ptr = self.start.as_ptr();
+    //       let end = self.current.get().as_ptr();
+    //
+    //       unsafe {
+    //           while ptr < end {
+    //               let header = &mut *(ptr as *mut BlockHeader);
+    //               if header.is_marked() {
+    //                   println!("Object {ptr:p} is marked. Keeping and unmarking");
+    //                   header.unmark();
+    //               } else {
+    //                   println!("Object {ptr:p} is unmarked. Sweeping (in principle, currently unimplemented)");
+    //               }
+    //
+    //               println!("Next object: {} bytes (header @ {ptr:p})", header.size);
+    //               ptr = ptr.wrapping_add(header.size + size_of::<BlockHeader>());
+    //           }
+    //       }
+    //   }
+
+    //   pub fn collect(&self) {
+    //       self.trace();
+    //       self.sweep();
+    //   }
+
+    pub fn collect(&self) {
+        // For new, we never collect the old generation
+        self.collect_young();
+    }
+
+    pub fn collect_young(&self) {
+        for root in self.roots.borrow().iter() {
+            let header = unsafe { &mut *(root.as_ptr() as *mut BlockHeader) };
+
+            debug_assert!(
+                !header.is_marked(),
+                "roots should always be unmarked at the beginning of the tracing phase"
+            );
+            header.trace();
+        }
+    }
+}
+
+impl HeapSpace {
     pub fn new(size: usize) -> Self {
         unsafe {
             let start = alloc(Layout::from_size_align(size, align_of::<u8>()).unwrap());
-            // We align `start` to the block header alignement for heap parsability
+            // We align `start` to the block header alignment for heap parsability
             let start = align_up(start, align_of::<BlockHeader>());
 
             let Some(start) = NonNull::new(start) else {
@@ -168,41 +289,34 @@ impl Heap {
             Self {
                 start,
                 current: Cell::new(start),
-                roots: RefCell::new(Vec::new()),
                 size,
             }
         }
     }
 
-    pub fn collect(&self) {
-        self.trace();
-        self.sweep();
-    }
-
-    pub fn alloc_root<T: Trace>(&self, value: T) -> Gc<T> {
-        self.alloc_impl(value, true)
-    }
-
-    pub fn alloc<T: Trace>(&self, value: T) -> Gc<T> {
-        self.alloc_impl(value, false)
-    }
-
-    fn alloc_impl<T: Trace>(&self, value: T, root: bool) -> Gc<T> {
+    /// Checks if there is enough space to allocate a value of type `T` in this space.
+    pub fn can_alloc<T: Trace>(&self) -> bool {
         let layout = Layout::new::<T>();
         let current = self.current.get().as_ptr();
 
-        // We're out of memory. Let's try to collect.
         // We are overly conservative with alignement padding and use an upper bound instead of
         // computing the exact value. It doesn't matter much for a few bytes.
-        if (current as usize)
-            + layout.size()
-            + size_of::<BlockHeader>()
-            + (align_of::<BlockHeader>() - 1)
-            + (layout.align() - 1)
-            >= (self.start.as_ptr() as usize) + self.size
-        {
-            self.collect();
-            return self.alloc_impl(value, root);
+        current
+            .wrapping_add(layout.size())
+            .wrapping_add(size_of::<BlockHeader>())
+            .wrapping_add(align_of::<BlockHeader>() - 1)
+            .wrapping_add(layout.align() - 1)
+            < self.start.as_ptr().wrapping_add(self.size)
+    }
+
+    /// Allocates an object in this space, or returns `None` if the space is full.
+    pub fn alloc<T: Trace>(&self, value: T) -> Gc<T> {
+        let layout = Layout::new::<T>();
+        let current = self.current.get().as_ptr();
+
+        if !self.can_alloc::<T>() {
+            panic!("out of memory");
+            // return self.alloc(value);
         }
 
         unsafe {
@@ -212,13 +326,6 @@ impl Heap {
             // Reserve space for the block header.
             // We maintain the following invariant: `current` is always `BlockHeader`-aligned
             let header_ptr = current as *mut BlockHeader;
-
-            if root {
-                self.roots
-                    .borrow_mut()
-                    // Safety: `header_ptr` is coming from `current`, which is NonNull
-                    .push(NonNull::new_unchecked(header_ptr));
-            }
 
             // Advance the current pointer to the next free address.
 
@@ -273,50 +380,42 @@ impl Heap {
         }
     }
 
+    fn iter(&self) -> impl std::iter::Iterator<Item = *mut BlockHeader> {
+        HeapSpaceIter {
+            curr: self.start.as_ptr(),
+            end: self.current.get().as_ptr(),
+        }
+    }
+
     pub fn parse(&self) {
-        let mut ptr = self.start.as_ptr();
-        let end = self.current.get().as_ptr();
-
-        unsafe {
-            while ptr < end {
-                let header = &*(ptr as *mut BlockHeader);
-                println!("Next object: {} bytes (header @ {ptr:p})", header.size());
-                ptr = ptr.wrapping_add(header.size() + size_of::<BlockHeader>());
-            }
+        for ptr in self.iter() {
+            let header = unsafe { &*ptr };
+            println!("Next object: {} bytes (header @ {ptr:p})", header.size());
         }
     }
+}
 
-    fn trace(&self) {
-        for root in self.roots.borrow().iter() {
-            eprintln!("Tracing root {root:p}");
+struct HeapSpaceIter {
+    curr: *mut u8,
+    end: *mut u8,
+}
 
-            let header = unsafe { &mut *(root.as_ptr() as *mut BlockHeader) };
-            debug_assert!(
-                !header.is_marked(),
-                "roots should always be unmarked at the beginning of the tracing phase"
-            );
-            header.trace();
+impl std::iter::Iterator for HeapSpaceIter {
+    type Item = *mut BlockHeader;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.curr >= self.end {
+            return None;
         }
-    }
 
-    pub fn sweep(&self) {
-        let mut ptr = self.start.as_ptr();
-        let end = self.current.get().as_ptr();
+        let next = self.curr as *mut BlockHeader;
+        let header = unsafe { &*next };
+        // println!("Next object: {} bytes (header @ {ptr:p})", header.size());
+        self.curr = self
+            .curr
+            .wrapping_add(header.size() + size_of::<BlockHeader>());
 
-        unsafe {
-            while ptr < end {
-                let header = &mut *(ptr as *mut BlockHeader);
-                if header.is_marked() {
-                    println!("Object {ptr:p} is marked. Keeping and unmarking");
-                    header.unmark();
-                } else {
-                    println!("Object {ptr:p} is unmarked. Sweeping (in principle, currently unimplemented)");
-                }
-
-                println!("Next object: {} bytes (header @ {ptr:p})", header.size);
-                ptr = ptr.wrapping_add(header.size + size_of::<BlockHeader>());
-            }
-        }
+        Some(next)
     }
 }
 

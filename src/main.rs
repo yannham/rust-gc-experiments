@@ -28,7 +28,7 @@ impl Trace for Foo {
 }
 
 fn main() {
-    let heap = Heap::new(64 * 1024 * 1024);
+    let heap = Heap::new(12 * 1024 * 1024, 64 * 1024 * 1024);
 
     let foo = heap.alloc(5);
     let bar = heap.alloc_root("hello, world".to_owned());
