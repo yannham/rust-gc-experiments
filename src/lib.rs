@@ -46,12 +46,9 @@ struct BlockHeader {
 }
 
 impl BlockHeader {
-    /// Marks the block as reachable. Returns the previous state of the mark bit (`true` if the
-    /// block was already marked).
-    pub fn mark(&mut self) -> bool {
-        let was_marked = self.is_marked();
+    /// Marks the block as reachable.
+    pub fn mark(&mut self) {
         self.size = self.size | MARK_BIT_MASK;
-        was_marked
     }
 
     pub fn unmark(&mut self) {
@@ -80,10 +77,11 @@ impl BlockHeader {
             };
             let header = unsafe { &mut *(gc.start.as_ptr()) };
 
-            if header.mark() {
+            if header.is_marked() {
                 continue;
             }
 
+            header.mark();
             (header.tracer)(value, &mut stack);
         }
     }
