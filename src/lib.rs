@@ -16,7 +16,8 @@ pub struct Heap {
     roots: RefCell<Vec<NonNull<BlockHeader>>>,
 }
 
-/// A heap from- or to-space, that is a bump-allocated contiguous area.
+/// A heap from- or to-space, that is a bump-allocated and automatically managed contiguous memory
+/// area.
 pub struct HeapSpace {
     /// Pointer to the start of the young generation. This address is always `BlockHeader`-aligned.
     start: NonNull<u8>,
@@ -26,21 +27,11 @@ pub struct HeapSpace {
     size: usize,
 }
 
-/// Mask of the bit used in [BlockHeader::size] either by the mark-and-sweep garbage collector of
-/// the mature space to record marked objects or by the moving collector of the young space to
-/// record evacuated objects. Since we need to distinguish a forwarding pointer from the size of a
-/// non-forwarded object, it must be never be set in native pointers.
-///
-/// In order to use the same block header implementation uniformly, and since we need the forwarded
-/// bit to be set to `1` by default to mean non-forwarded (distinguishing it from pointers), we use
-/// `1` to mean NON marked and `0` to mean marked, perhaps counter-intuitively. Doing so, we can
-/// always initialize the mark bit to `1`.
-const MARK_BIT_MASK: usize = 1;
-
 /// A item of the collector work list.
 pub struct TraceEntry {
     /// A pointer to the field of the object being traced, which is itself a pointer to a
-    /// garbage-collected object. Can be null for root objects or during mark-and-sweep collection.
+    /// garbage-collected object ([Self::pointee]). [Self::field] can be null for root objects or
+    /// during mark-and-sweep collection.
     field: *mut GcPtr,
     /// The pointee of the object's field.
     pointee: GcPtr,
@@ -60,6 +51,24 @@ pub type Tracer = fn(*const u8, &mut Vec<TraceEntry>);
 
 /// The header of a heap-allocated value.
 struct BlockHeader {
+    /// This is a composite integer holding size and alignement information. We'll detail its
+    /// content starting from the least significant bits.
+    ///
+    /// # Bit 0
+    ///
+    /// The least significant bit holds the mark and sweep or the forwarded flag, depending on the
+    /// space. So size is in the `usize-1` most significant bits of this field.
+    ///
+    /// # Bits 1-6 (inclusive)
+    ///
+    /// The next 6 bits stores the log2 of the alignment of the object. We need this information
+    /// when moving objects from a from-space to a to-space: while the slots of a space are always
+    /// `BlockHeader`-aligned, it's not guaranteed that copying blindly the bytes will result in a
+    /// aligned pointer for the beginning of the content. Upon moving, we thus recompute padding,
+    /// which requires to know the alignement.
+    ///
+    /// # Bits 7-63 (inclusive)
+    ///
     /// Size in bytes of the allocated chunk, including the padding at the end of this header and
     /// before the content and the padding at the end of the content (so that the next entry is
     /// `BlockHeader`-aligned). Doesn't include the size of the header itself.
@@ -76,8 +85,6 @@ struct BlockHeader {
     ///
     /// `size` is `e - b` when interpreted as memory addresses.
     ///
-    /// The least significant bit holds the mark and sweep or the forwarded flag, depending on the
-    /// space. So size is in the `usize-1` most significant bits of this field.
     size: usize,
     /// The padding between the header and the beginning of the object ((b) in the diagram
     /// describing [Self::size]).
@@ -87,9 +94,33 @@ struct BlockHeader {
 }
 
 impl BlockHeader {
-    pub fn new(size: usize, padding: usize, tracer: Tracer) -> Self {
+    /// Mask of the bit used in [BlockHeader::size] either by the mark-and-sweep garbage collector of
+    /// the mature space to record marked objects or by the moving collector of the young space to
+    /// record evacuated objects. Since we need to distinguish a forwarding pointer from the size of a
+    /// non-forwarded object, it must be never be set in native pointers.
+    ///
+    /// In order to use the same block header implementation uniformly, and since we need the forwarded
+    /// bit to be set to `1` by default to mean non-forwarded (distinguishing it from pointers), we use
+    /// `1` to mean NON marked and `0` to mean marked, perhaps counter-intuitively. Doing so, we can
+    /// always initialize the mark bit to `1`.
+    const MARK_BIT_MASK: usize = 1;
+    /// Mask of the bits used to store the alignment of the object.
+    const ALIGN_MASK: usize = 0b1111110;
+    /// Mask of the bits used to store the size of the object.
+    const SIZE_MASK: usize = !Self::MARK_BIT_MASK & !Self::ALIGN_MASK;
+
+    const ALIGN_SHIFT: usize = Self::ALIGN_MASK.trailing_zeros() as usize;
+    const SIZE_SHIFT: usize = Self::SIZE_MASK.trailing_zeros() as usize;
+
+    /// Create a new block header, given the size of the object, its alignment, its padding and the
+    /// tracer. The alignement is given in bytes, and must be a power of 2.
+    pub fn new(size: usize, align: usize, padding: usize, tracer: Tracer) -> Self {
+        // Given our encoding (which is quite arbitrary and wasteful for now; it's just a proof of
+        // concept), the size must be representable on `std::mem::sizeof::<usize>() - 7` bits.
+        assert!(size <= (Self::SIZE_MASK >> Self::SIZE_SHIFT));
+
         Self {
-            size: (size << 1) | MARK_BIT_MASK,
+            size: (size << Self::SIZE_SHIFT) | (align << Self::ALIGN_SHIFT) | Self::MARK_BIT_MASK,
             padding,
             tracer,
         }
@@ -97,17 +128,17 @@ impl BlockHeader {
 
     /// Marks the block as reachable.
     pub fn mark(&mut self) {
-        self.size = self.size & !MARK_BIT_MASK;
+        self.size = self.size & !Self::MARK_BIT_MASK;
     }
 
     /// Unmark the block after a collection.
     pub fn unmark(&mut self) {
-        self.size = self.size | MARK_BIT_MASK;
+        self.size = self.size | Self::MARK_BIT_MASK;
     }
 
     /// Check if this block is marked.
     pub fn is_marked(&self) -> bool {
-        (self.size & MARK_BIT_MASK) == 0
+        (self.size & Self::MARK_BIT_MASK) == 0
     }
 
     /// During a moving collection, overwrite the first word of the header (`size`) with a the new
@@ -133,7 +164,13 @@ impl BlockHeader {
     /// Returns the size of the allocated chunk in bytes (accounting for everything but the header
     /// size, see [Self::size] and [Self::full_size]), filtering out the mark bit.
     pub fn size(&self) -> usize {
-        self.size >> 1
+        self.size >> Self::SIZE_SHIFT
+    }
+
+    /// Returns the the alignement in bytes of the content.
+    pub fn align(&self) -> usize {
+        let align_log2 = (self.size & Self::ALIGN_MASK) >> Self::ALIGN_SHIFT;
+        1 << align_log2
     }
 
     /// Returns the total size of the allocation, from the beginning of the header to the end of
@@ -393,9 +430,14 @@ impl HeapSpace {
         self.start.as_ptr().wrapping_add(self.size)
     }
 
-    /// Checks if there is enough space to allocate a value of type `T` in this space.
+    /// Checks if there is enough space to allocate a value of type `T` in this space. Same as
+    /// `self.can_alloc_layout(Layout::new::<T>())`.
     pub fn can_alloc<T: Trace>(&self) -> bool {
-        let layout = Layout::new::<T>();
+        self.can_alloc_layout(Layout::new::<T>())
+    }
+
+    /// Checks if there is enough space to allocate a new object with a given layout in this space.
+    pub fn can_alloc_layout(&self, layout: Layout) -> bool {
         let current = self.current.get().as_ptr();
 
         // We are overly conservative with alignement padding and use an upper bound instead of
@@ -408,13 +450,13 @@ impl HeapSpace {
             < self.end()
     }
 
-    /// Checks if there is enough space to allocate a new object as a copy of an existing one.
-    pub fn can_copy(&self, from: GcPtr) -> bool {
-        let current = self.current.get().as_ptr();
-        let header = unsafe { from.start.as_ref() };
-
-        current.wrapping_add(header.alloc_total_size()) < self.end()
-    }
+    // /// Checks if there is enough space to allocate a new object as a copy of an existing one.
+    // pub fn can_copy(&self, from: GcPtr) -> bool {
+    //     let current = self.current.get().as_ptr();
+    //     let header = unsafe { from.start.as_ref() };
+    //
+    //     current.wrapping_add(header.alloc_total_size()) < self.end()
+    // }
 
     /// Allocates an object in this space, or returns `None` if the space is full.
     pub fn alloc<T: Trace>(&self, value: T) -> Gc<T> {
@@ -429,7 +471,7 @@ impl HeapSpace {
         unsafe {
             let prev_cur = current;
             // We need to keep one bit for the mark and seep. It's initialized to zero by default.
-            assert!(layout.size() & MARK_BIT_MASK == 0);
+            assert!(layout.size() & BlockHeader::MARK_BIT_MASK == 0);
             // Reserve space for the block header.
             // We maintain the following invariant: `current` is always `BlockHeader`-aligned
             let header_ptr = current as *mut BlockHeader;
@@ -493,17 +535,54 @@ impl HeapSpace {
     //`BlockHeader`'s alignement. By chance the end of the original header could end exactly at an
     //`a`-aligned address, but nothing guarantees that this is the case in the two-space.
     pub fn copy(&self, from: GcPtr) -> GcPtr {
-        if !self.can_copy(from) {
+        let from_header = unsafe { from.start.as_ref() };
+
+        let layout = {
+            let header = unsafe { from.start.as_ref() };
+            Layout::from_size_align(header.size(), header.align()).unwrap()
+        };
+
+        if !self.can_alloc_layout(layout) {
             panic!("out of memory");
         }
 
         let current = self.current.get().as_ptr();
-        let full_size = unsafe { from.start.as_ref().alloc_total_size() };
 
+        // See Self::alloc for safety and explanation. The following is just a simpler version of
+        // allocation, where we copy chunks of the original object instead of writing new data.
         unsafe {
-            std::ptr::copy(from.start.as_ptr() as *const u8, current, full_size);
-            let next_slot = current.add(full_size);
+            let prev_cur = current;
+            assert!(layout.size() & BlockHeader::MARK_BIT_MASK == 0);
+            let header_ptr = current as *mut BlockHeader;
+
+            let unaligned_slot = current.add(size_of::<BlockHeader>());
+
+            assert!(layout.align() * size_of::<u8>() < (isize::MAX as usize));
+            let slot = align_up(unaligned_slot, layout.align());
+
+            let next_slot = align_up(slot.add(layout.size()), align_of::<BlockHeader>());
             self.current.set(NonNull::new_unchecked(next_slot));
+
+            // Now that we have the total size of the allocated chunk including padding, we can
+            // write the block header.
+            println!(
+                "Copying block header (size {}) to {header_ptr:p} (current was {prev_cur:p})",
+                (next_slot as usize) - (unaligned_slot as usize)
+            );
+
+            ptr::write(
+                header_ptr,
+                BlockHeader {
+                    size: (next_slot as usize) - (unaligned_slot as usize),
+                    padding: (slot as usize) - (unaligned_slot as usize),
+                    tracer: from_header.tracer,
+                },
+            );
+
+            let from_content_start = (from.start.as_ptr() as *const u8)
+                .add(size_of::<BlockHeader>() + from_header.padding);
+            std::ptr::copy(from_content_start, slot, todo!("we must extract the exact size of the content, but currently we can only get the size of the content + end padding"));
+
             GcPtr {
                 start: NonNull::new_unchecked(current as *mut BlockHeader),
             }
