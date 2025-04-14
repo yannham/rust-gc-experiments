@@ -32,12 +32,13 @@ pub struct TraceEntry {
     /// A pointer to the field of the object being traced, which is itself a pointer to a
     /// garbage-collected object ([Self::pointee]). [Self::field] can be null for root objects or
     /// during mark-and-sweep collection.
-    field: *mut GcPtr,
+    pub field: *mut NonNull<BlockHeader>,
     /// The pointee of the object's field.
-    pointee: GcPtr,
+    pub pointee: GcPtr,
 }
 
 impl TraceEntry {
+    /// Creates a trace entry for a root object with [Self::field] set to `null`.
     pub fn pointee_only(pointee: GcPtr) -> Self {
         TraceEntry {
             field: ptr::null_mut(),
@@ -47,10 +48,10 @@ impl TraceEntry {
 }
 
 /// A function pointer to an object implementing [Trace].
-pub type Tracer = fn(*const u8, &mut Vec<TraceEntry>);
+pub type Tracer = fn(*mut u8, &mut Vec<TraceEntry>);
 
 /// The header of a heap-allocated value.
-struct BlockHeader {
+pub struct BlockHeader {
     /// This is a composite integer holding size and alignement information. We'll detail its
     /// content starting from the least significant bits.
     ///
@@ -203,7 +204,7 @@ impl BlockHeader {
             // Thus the `add` operation sill end up within the bounds of the heap space.
             let header = unsafe { &mut *(gc.start.as_ptr()) };
             let value = unsafe {
-                (gc.start.as_ptr() as *const u8).add(size_of::<BlockHeader>() + header.padding)
+                (gc.start.as_ptr() as *mut u8).add(size_of::<BlockHeader>() + header.padding)
             };
 
             if header.is_marked() {
@@ -237,14 +238,14 @@ impl BlockHeader {
                 let to_addr = to_space.copy(pointee);
                 let to_header = &*(to_addr.start.as_ptr());
                 from_header.forward(to_addr);
-                let to_value = (to_addr.start.as_ptr() as *const u8)
+                let to_value = (to_addr.start.as_ptr() as *mut u8)
                     .add(size_of::<BlockHeader>() + to_header.padding);
                 (to_header.tracer)(to_value, &mut stack);
                 to_addr
             });
 
             unsafe {
-                field.write(new_addr);
+                field.write(new_addr.start);
             }
         }
 
@@ -253,6 +254,8 @@ impl BlockHeader {
 }
 
 pub struct Gc<T> {
+    // TODO: should this be an unsafe cell, for the evacutor to be able to write it without
+    // sweating about aliasing rules?
     start: NonNull<BlockHeader>,
     _marker: std::marker::PhantomData<T>,
 }
@@ -265,6 +268,10 @@ pub struct GcPtr {
 impl<T> Gc<T> {
     pub fn as_gc_ptr(&self) -> GcPtr {
         GcPtr { start: self.start }
+    }
+
+    pub fn as_field_ptr(&mut self) -> *mut NonNull<BlockHeader> {
+        &mut self.start as *mut NonNull<BlockHeader>
     }
 }
 
@@ -305,7 +312,7 @@ impl<T: fmt::Debug> fmt::Debug for Gc<T> {
 }
 
 pub trait Trace {
-    fn trace(&self, _stack: &mut Vec<TraceEntry>) {}
+    fn trace(&mut self, _stack: &mut Vec<TraceEntry>) {}
 }
 
 impl Trace for usize {}
@@ -328,7 +335,7 @@ impl Heap {
         gced
     }
 
-    fn alloc<T: Trace>(&self, value: T) -> Gc<T> {
+    pub fn alloc<T: Trace>(&self, value: T) -> Gc<T> {
         if self.young_space.can_alloc::<T>() {
             self.young_space.alloc(value)
         } else {
@@ -511,7 +518,7 @@ impl HeapSpace {
                 BlockHeader {
                     size: (next_slot as usize) - (unaligned_slot as usize),
                     padding: (slot as usize) - (unaligned_slot as usize),
-                    tracer: |obj, stack| T::trace(&*(obj as *const T), stack),
+                    tracer: |obj, stack| T::trace(&mut *(obj as *mut T), stack),
                 },
             );
 

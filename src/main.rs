@@ -1,4 +1,4 @@
-use bump_alloc::{Gc, GcPtr, Heap, Trace};
+use nicki_menaj::{Gc, GcPtr, Heap, Trace, TraceEntry};
 
 #[derive(Debug)]
 struct Baz {
@@ -15,15 +15,18 @@ struct Foo {
 }
 
 impl Trace for Baz {
-    fn trace(&self, _stack: &mut Vec<GcPtr>) {
+    fn trace(&mut self, _stack: &mut Vec<TraceEntry>) {
         eprintln!("Tracing baz");
     }
 }
 
 impl Trace for Foo {
-    fn trace(&self, stack: &mut Vec<GcPtr>) {
+    fn trace(&mut self, stack: &mut Vec<TraceEntry>) {
         eprintln!("Tracing foo");
-        stack.push(self.thd.as_gc_ptr());
+        stack.push(TraceEntry {
+            field: self.thd.as_field_ptr(),
+            pointee: self.thd.as_gc_ptr(),
+        });
     }
 }
 
