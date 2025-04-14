@@ -38,6 +38,8 @@ pub struct TraceEntry {
 
 impl TraceEntry {
     /// Creates a trace entry for a root object with [Self::field] set to `null`.
+    // TODO: this isn't the right approach. We also need to update the root pointers when moving
+    // them to the mature space, or we'll keep dangling pointers to the cleaned young space.
     pub fn pointee_only(pointee: GcPtr) -> Self {
         TraceEntry {
             field: ptr::null_mut(),
