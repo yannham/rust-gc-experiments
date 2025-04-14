@@ -1,6 +1,12 @@
 [package]
-name = "bump-alloc"
+name = "nicki_menaj"
+description = "Experimental garbage collector implementations to practice The Garbage Collection Handbook"
+author = "Yann Hamdaoui"
+license = "WTFPL"
 version = "0.1.0"
+repository = "https://github.com/yannham/rust-gc-experiments"
+readme = "README.md"
+categories = ["memory-management"]
 edition = "2021"
 
 [dependencies]
