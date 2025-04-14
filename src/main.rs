@@ -60,8 +60,15 @@ fn main() {
 
     println!("Alloced {foo:?}, {bar:?}, {baz:?}, {baz_deps:?} and {foo_struct:?}");
 
+    eprintln!("State before first collection");
+    heap.parse_young();
+
     eprintln!("First collection");
     heap.collect();
+
+    eprintln!("State after first collection");
+    heap.parse_young();
+
     eprintln!("Second collection");
     heap.collect();
 }
