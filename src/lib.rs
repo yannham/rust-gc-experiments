@@ -52,7 +52,7 @@ pub type Tracer = fn(*mut u8, &mut Vec<TraceEntry>);
 
 /// The header of a heap-allocated value.
 pub struct BlockHeader {
-    /// This is a composite integer holding size and alignement information. We'll detail its
+    /// This is a composite integer holding size and alignment information. We'll detail its
     /// content starting from the least significant bits.
     ///
     /// # Bit 0
@@ -66,7 +66,7 @@ pub struct BlockHeader {
     /// when moving objects from a from-space to a to-space: while the slots of a space are always
     /// `BlockHeader`-aligned, it's not guaranteed that copying blindly the bytes will result in a
     /// aligned pointer for the beginning of the content. Upon moving, we thus recompute padding,
-    /// which requires to know the alignement.
+    /// which requires to know the alignment.
     ///
     /// # Bits 7-63 (inclusive)
     ///
@@ -114,7 +114,7 @@ impl BlockHeader {
     const SIZE_SHIFT: usize = Self::SIZE_MASK.trailing_zeros() as usize;
 
     /// Create a new block header, given the size of the object, its alignment, its padding and the
-    /// tracer. The alignement is given in bytes, and must be a power of 2.
+    /// tracer. The alignment is given in bytes, and must be a power of 2.
     pub fn new(size: usize, align: usize, padding: usize, tracer: Tracer) -> Self {
         // Given our encoding (which is quite arbitrary and wasteful for now; it's just a proof of
         // concept), the size must be representable on `std::mem::sizeof::<usize>() - 7` bits.
@@ -168,7 +168,7 @@ impl BlockHeader {
         self.size >> Self::SIZE_SHIFT
     }
 
-    /// Returns the the alignement in bytes of the content.
+    /// Returns the the alignment in bytes of the content.
     pub fn align(&self) -> usize {
         let align_log2 = (self.size & Self::ALIGN_MASK) >> Self::ALIGN_SHIFT;
         1 << align_log2
@@ -447,7 +447,7 @@ impl HeapSpace {
     pub fn can_alloc_layout(&self, layout: Layout) -> bool {
         let current = self.current.get().as_ptr();
 
-        // We are overly conservative with alignement padding and use an upper bound instead of
+        // We are overly conservative with alignment padding and use an upper bound instead of
         // computing the exact value. It doesn't matter much for a few bytes.
         current
             .wrapping_add(layout.size())
@@ -538,8 +538,8 @@ impl HeapSpace {
 
     /// Copy an existing [GcPtr], potentially from a different space, to this space.
     //TODO: this is wrong! We can't guarantee that blindly copying the header and the value will
-    //preserve the value's alignement. Take a value with an alignment `a` bigger than
-    //`BlockHeader`'s alignement. By chance the end of the original header could end exactly at an
+    //preserve the value's alignment. Take a value with an alignment `a` bigger than
+    //`BlockHeader`'s alignment. By chance the end of the original header could end exactly at an
     //`a`-aligned address, but nothing guarantees that this is the case in the two-space.
     pub fn copy(&self, from: GcPtr) -> GcPtr {
         let from_header = unsafe { from.start.as_ref() };
