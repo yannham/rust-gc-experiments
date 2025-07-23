@@ -1,5 +1,5 @@
 use std::alloc::{alloc, Layout};
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 use std::fmt;
 use std::mem::align_of;
 use std::ops::Deref;
@@ -25,23 +25,76 @@ pub struct HeapSpace {
 }
 
 /// A item of the collector work list.
+#[derive(Clone, Copy)]
 pub struct TraceEntry {
     /// A pointer to the field of the object being traced, which is itself a pointer to a
-    /// garbage-collected object ([Self::pointee]). [Self::field] can be null for root objects or
-    /// during mark-and-sweep collection.
+    /// garbage-collected object.
     pub field: *mut NonNull<BlockHeader>,
-    /// The pointee of the object's field.
-    pub pointee: GcPtr,
 }
 
 impl TraceEntry {
-    /// Creates a trace entry for a root object with [Self::field] set to `null`.
-    // TODO: this isn't the right approach. We also need to update the root pointers when moving
-    // them to the mature space, or we'll keep dangling pointers to the cleaned young space.
-    pub fn pointee_only(pointee: GcPtr) -> Self {
-        TraceEntry {
-            field: ptr::null_mut(),
-            pointee,
+    /// Trace and mark all reachable objects from this block.
+    ///
+    /// # Safety
+    ///
+    /// `self.field` must be a valid, writable pointer to a [GcPtr].
+    pub unsafe fn mark(self) {
+        let mut stack = vec![self];
+        while let Some(TraceEntry { field }) = stack.pop() {
+            eprintln!("Trace loop: popping");
+
+            // Safety: any pointer stored in the stack must be a block header pointer in one of the
+            // GC managed space. Such pointers are guaranteed to
+            //
+            // 1. Point to a valid block header
+            // 2. The block header is followed by a valid object at the end of the header + padding
+            //
+            // Thus the `add` operation sill end up within the bounds of the heap space.
+            let start = unsafe { (*field).as_ptr() };
+            let header = unsafe { &mut *start };
+            let value = unsafe {
+                (start as *mut u8).add(size_of::<BlockHeader>() + (header.start_padding as usize))
+            };
+
+            if header.is_marked() {
+                continue;
+            }
+
+            header.mark();
+            (header.tracer)(value, &mut stack);
+        }
+    }
+
+    /// Evacuate the block pointed to by the field of this trace entry to the mature space and
+    /// update the trace entry with the address of the new copy.
+    ///
+    /// # Safety
+    ///
+    /// `self.field` must be a valid, writable pointer to a [GcPtr].
+    pub fn evacuate(self, to_space: &HeapSpace) {
+        let mut stack = vec![self];
+
+        while let Some(TraceEntry { field }) = stack.pop() {
+            let pointee = unsafe { *field };
+            eprintln!("Evacuate loop: processing {field:p} -> {:p}", pointee);
+
+            let from_header = unsafe { &mut *(pointee.as_ptr()) };
+
+            let new_addr = from_header.forwarding_addr().unwrap_or_else(|| unsafe {
+                let to_addr = to_space.copy(GcPtr { start: pointee });
+                let to_header = &*(to_addr.start.as_ptr());
+                from_header.forward(to_addr);
+                let to_value = (to_addr.start.as_ptr() as *mut u8)
+                    .add(size_of::<BlockHeader>() + (to_header.start_padding as usize));
+                (to_header.tracer)(to_value, &mut stack);
+                to_addr
+            });
+
+            eprintln!("Moved {:p} to {:p}", pointee, new_addr.start);
+
+            unsafe {
+                field.write(new_addr.start);
+            }
         }
     }
 }
@@ -97,7 +150,6 @@ impl BlockHeader {
     ) -> Self {
         let align_log2 = align.ilog2();
 
-        assert!(size & 1 == 0);
         assert!(align_log2 <= u8::MAX as u32);
         assert!(start_padding <= u8::MAX as usize);
         assert!(end_padding <= u8::MAX as usize);
@@ -105,7 +157,7 @@ impl BlockHeader {
         Self {
             mark_bit: false,
             align: align_log2 as u8,
-            size: size | 1,
+            size,
             start_padding: start_padding as u8,
             end_padding: end_padding as u8,
             tracer,
@@ -132,12 +184,13 @@ impl BlockHeader {
     /// address of this object in the mature space. Since pointers are at least 2-byte aligned, the
     /// forwarding bit is zero, which distinguishes this block from an as-of-yet not moved block.
     pub fn forward(&mut self, new_ptr: GcPtr) {
-        self.size = new_ptr.start.as_ptr() as usize
+        self.size = new_ptr.start.as_ptr() as usize;
+        self.mark_bit = false;
     }
 
     /// Checks if this block has been moved already during a moving collection.
     pub fn is_forwarded(&self) -> bool {
-        self.size & 1 == 0
+        self.is_marked()
     }
 
     /// Returns the forwarding address of the block if this block has already been moved during a
@@ -146,12 +199,6 @@ impl BlockHeader {
         self.is_forwarded().then_some(GcPtr {
             start: NonNull::new(self.size as *mut BlockHeader).unwrap(),
         })
-    }
-
-    /// Returns the size of the allocated chunk in bytes (accounting for everything but the header
-    /// size, see [Self::size] and [Self::full_size]), filtering out the mark bit.
-    pub fn size(&self) -> usize {
-        self.size & !1
     }
 
     /// Returns the the alignment in bytes of the content.
@@ -164,84 +211,7 @@ impl BlockHeader {
     /// the next block header in the heap or to the next uninitialized memory slot if this block is
     /// currently the last allocated.
     pub fn alloc_total_size(&self) -> usize {
-        self.size() + std::mem::size_of::<BlockHeader>()
-    }
-
-    /// Trace and mark all reachable objects from this block.
-    pub fn trace(&self) {
-        let mut stack = vec![TraceEntry::pointee_only(GcPtr {
-            start: NonNull::new(ptr::from_ref(self) as *mut BlockHeader).unwrap(),
-        })];
-
-        while let Some(TraceEntry {
-            field: _,
-            pointee: gc,
-        }) = stack.pop()
-        {
-            eprintln!("Trace loop: popping");
-
-            // Safety: any pointer stored in the stack must be a block header pointer in one of the
-            // GC managed space. Such pointers are guaranteed to
-            //
-            // 1. Point to a valid block header
-            // 2. The block header is followed by a valid object at the end of the header + padding
-            //
-            // Thus the `add` operation sill end up within the bounds of the heap space.
-            let header = unsafe { &mut *(gc.start.as_ptr()) };
-            let value = unsafe {
-                (gc.start.as_ptr() as *mut u8)
-                    .add(size_of::<BlockHeader>() + (header.start_padding as usize))
-            };
-
-            if header.is_marked() {
-                continue;
-            }
-
-            header.mark();
-            (header.tracer)(value, &mut stack);
-        }
-    }
-
-    /// Evacuate this block to the mature space and return the address of the new copy.
-    pub fn evacuate(&mut self, to_space: &HeapSpace) -> GcPtr {
-        let self_ptr: *mut BlockHeader = self;
-        //TODO: we double-evacute self here
-        let new_addr = unsafe {
-            to_space.copy(GcPtr {
-                start: NonNull::new_unchecked(self_ptr),
-            })
-        };
-
-        let mut stack = vec![TraceEntry::pointee_only(GcPtr {
-            start: NonNull::new(new_addr.start.as_ptr()).unwrap(),
-        })];
-
-        while let Some(TraceEntry { pointee, field }) = stack.pop() {
-            eprintln!("Evacuate loop: processing {field:p} -> {:p}", pointee.start);
-
-            let from_header = unsafe { &mut *(pointee.start.as_ptr()) };
-
-            let new_addr = from_header.forwarding_addr().unwrap_or_else(|| unsafe {
-                let to_addr = to_space.copy(pointee);
-                let to_header = &*(to_addr.start.as_ptr());
-                from_header.forward(to_addr);
-                let to_value = (to_addr.start.as_ptr() as *mut u8)
-                    .add(size_of::<BlockHeader>() + (to_header.start_padding as usize));
-                (to_header.tracer)(to_value, &mut stack);
-                to_addr
-            });
-
-            eprintln!("Moved {:p} to {:p}", pointee.start, new_addr.start);
-
-            unsafe {
-                if !field.is_null() {
-                    eprintln!("Field is non-null, overwriting pointer to the new address");
-                    field.write(new_addr.start);
-                }
-            }
-        }
-
-        new_addr
+        self.size + std::mem::size_of::<BlockHeader>()
     }
 }
 
@@ -266,8 +236,10 @@ impl<T> Gc<T> {
         GcPtr { start: self.start }
     }
 
-    pub fn as_field_ptr(&mut self) -> *mut NonNull<BlockHeader> {
-        &mut self.start as *mut NonNull<BlockHeader>
+    pub fn as_trace_entry(&mut self) -> TraceEntry {
+        TraceEntry {
+            field: &mut self.start as *mut NonNull<BlockHeader>,
+        }
     }
 }
 
@@ -335,9 +307,10 @@ impl Heap {
             .then(|| self.young_space.alloc(value))
     }
 
-    fn trace(&self, stack: &mut MemoryManager) {
-        for gc_ptr in stack.iter() {
-            let root = gc_ptr.start;
+    /// Marking phase of the mark and sweep algorithm.
+    fn mark(&self, stack: &mut MemoryManager) {
+        for entry in stack.iter_as_trace_entries() {
+            let root = unsafe { *entry.field };
             eprintln!("Tracing root {root:p}");
 
             let header = unsafe { &mut *(root.as_ptr() as *mut BlockHeader) };
@@ -345,7 +318,9 @@ impl Heap {
                 !header.is_marked(),
                 "roots should always be unmarked at the beginning of the tracing phase"
             );
-            header.trace();
+            // Safety: `gc_ptr` is a valid GcPtr created from a mutable reference (that isn't used
+            // anymore).
+            unsafe { entry.mark() }
         }
     }
 
@@ -380,8 +355,8 @@ impl Heap {
     }
 
     pub fn collect_young(&self, stack: &mut MemoryManager) {
-        for gc_ptr in stack.iter_mut() {
-            let root = gc_ptr.start;
+        for entry in stack.iter_as_trace_entries() {
+            let root = unsafe { *entry.field };
             eprintln!("-- Processing root {root:p}");
 
             if !self.young_space.contains(root.as_ptr()) {
@@ -396,10 +371,11 @@ impl Heap {
                 "roots should always be unmarked at the beginning of the tracing phase"
             );
 
-            let dst = header.evacuate(&self.mature_space);
-
-            eprintln!("Moved root {root:p} -> {dst:p}", dst = dst.start);
-            *gc_ptr = dst;
+            entry.evacuate(&self.mature_space);
+            eprintln!(
+                "Moved root {root:p} -> {dst:p}",
+                dst = unsafe { *entry.field }
+            );
         }
 
         self.young_space.current.set(self.young_space.start);
@@ -486,8 +462,6 @@ impl HeapSpace {
 
         unsafe {
             let prev_cur = current;
-            // We need to keep one bit for the mark and seep. It's initialized to zero by default.
-            assert!(layout.size() & 1 == 0);
             // Reserve space for the block header.
             // We maintain the following invariant: `current` is always `BlockHeader`-aligned
             let header_ptr = current as *mut BlockHeader;
@@ -553,7 +527,7 @@ impl HeapSpace {
 
         let layout = {
             let header = unsafe { from.start.as_ref() };
-            Layout::from_size_align(header.size(), header.align()).unwrap()
+            Layout::from_size_align(header.size, header.align()).unwrap()
         };
 
         if !self.can_alloc_layout(layout) {
@@ -565,8 +539,6 @@ impl HeapSpace {
         // See Self::alloc for safety and explanation. The following is just a simpler version of
         // allocation, where we copy chunks of the original object instead of writing new data.
         unsafe {
-            let prev_cur = current;
-            assert!(layout.size() & 1 == 0);
             let header_ptr = current as *mut BlockHeader;
 
             let unaligned_slot = current.add(size_of::<BlockHeader>());
@@ -598,7 +570,7 @@ impl HeapSpace {
             let from_content_start = (from.start.as_ptr() as *const u8)
                 .add(size_of::<BlockHeader>() + (from_header.start_padding as usize));
             // The size of the content only
-            let content_size = from_header.size()
+            let content_size = from_header.size
                 - (from_header.start_padding as usize)
                 - (from_header.end_padding as usize);
             std::ptr::copy(from_content_start, slot, content_size);
@@ -619,7 +591,7 @@ impl HeapSpace {
     pub fn parse(&self) {
         for ptr in self.iter() {
             let header = unsafe { &*ptr };
-            println!("Next object: {} bytes (header @ {ptr:p})", header.size());
+            println!("Next object: {} bytes (header @ {ptr:p})", header.size);
         }
     }
 
@@ -649,7 +621,7 @@ impl std::iter::Iterator for HeapSpaceIter {
         // println!("Next object: {} bytes (header @ {ptr:p})", header.size());
         self.curr = self
             .curr
-            .wrapping_add(header.size() + size_of::<BlockHeader>());
+            .wrapping_add(header.size + size_of::<BlockHeader>());
 
         Some(next)
     }
@@ -752,5 +724,18 @@ impl MemoryManager {
 
     pub fn get<T>(&self, index: GcIndex<T>) -> Gc<T> {
         self.get_weak(index).unwrap()
+    }
+
+    /// Iterate over the live roots of this memory manager seen as trace entries.
+    fn iter_as_trace_entries(&mut self) -> impl Iterator<Item = TraceEntry> + '_ {
+        self.iter_mut().map(|gc_ptr| TraceEntry {
+            field: &mut gc_ptr.start as *mut NonNull<BlockHeader>,
+        })
+    }
+}
+
+impl<T> fmt::Pointer for Gc<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:p}", self.start)
     }
 }
