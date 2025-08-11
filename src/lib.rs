@@ -8,9 +8,9 @@ use std::ptr::{self, NonNull};
 /// The garbage-collected heap.
 pub struct Heap {
     /// The space for allocating new objects.
-    young_space: HeapSpace,
+    young_space: YoungSpace,
     /// The space for evacuating objets that survived a young collection.
-    mature_space: HeapSpace,
+    mature_space: MatureSpace,
 }
 
 /// A heap from- or to-space, that is a bump-allocated and automatically managed contiguous memory
@@ -18,7 +18,7 @@ pub struct Heap {
 pub struct HeapSpace {
     /// Pointer to the start of the young generation. This address is always `BlockHeader`-aligned.
     start: NonNull<u8>,
-    /// Pointer to the next free address in the young generation. This address is always `BlockHeader`-aligned.
+    /// Pointer to the next free address. This address is always `BlockHeader`-aligned.
     current: Cell<NonNull<u8>>,
     /// The size of the heap space in bytes.
     size: usize,
@@ -30,6 +30,11 @@ pub struct TraceEntry {
     /// A pointer to the field of the object being traced, which is itself a pointer to a
     /// garbage-collected object.
     pub field: *mut NonNull<BlockHeader>,
+}
+
+pub trait AllocSpace {
+    /// Copy an existing [GcPtr], potentially from a different space, to this space.
+    fn copy(&self, obj: GcPtr) -> GcPtr;
 }
 
 impl TraceEntry {
@@ -71,7 +76,7 @@ impl TraceEntry {
     /// # Safety
     ///
     /// `self.field` must be a valid, writable pointer to a [GcPtr].
-    pub fn evacuate(self, to_space: &HeapSpace) {
+    pub fn evacuate(self, to_space: &impl AllocSpace) {
         let mut stack = vec![self];
 
         while let Some(TraceEntry { field }) = stack.pop() {
@@ -102,10 +107,22 @@ impl TraceEntry {
 /// A function pointer to an object implementing [Trace].
 pub type Tracer = fn(*mut u8, &mut Vec<TraceEntry>);
 
+/// A tracer that does nothing.
+fn noop_tracer(_: *mut u8, _: &mut Vec<TraceEntry>) {}
+
+/// The two type of blocks (free or allocated). For free blocks, we include there the additional
+/// data of the next free block in the list, if any.
+pub enum BlockType {
+    Allocated,
+    Free { next: Option<NonNull<BlockHeader>> },
+}
+
 /// The header of a heap-allocated value.
 pub struct BlockHeader {
     /// The mark and sweep or the forwarded flag, depending on the space.
     mark_bit: bool,
+    /// If this block is allocated or not (and associated metadata).
+    block_type: BlockType,
     /// The log2 of the alignment of the object. We need this information when moving objects from
     /// a from-space to a to-space: while the slots of a space are always `BlockHeader`-aligned,
     /// it's not guaranteed that copying blindly the bytes will result in a aligned pointer for the
@@ -156,11 +173,25 @@ impl BlockHeader {
 
         Self {
             mark_bit: false,
+            block_type: BlockType::Allocated,
             align: align_log2 as u8,
             size,
             start_padding: start_padding as u8,
             end_padding: end_padding as u8,
             tracer,
+        }
+    }
+
+    /// Creates a new header for an empty block with the given size.
+    pub fn empty(size: usize, next: Option<NonNull<BlockHeader>>) -> Self {
+        Self {
+            mark_bit: false,
+            block_type: BlockType::Free { next },
+            align: 0,
+            size,
+            start_padding: 0,
+            end_padding: 0,
+            tracer: noop_tracer,
         }
     }
 
@@ -290,18 +321,18 @@ impl Trace for i32 {}
 impl Heap {
     pub fn new(young_size: usize, old_size: usize) -> Self {
         Self {
-            young_space: HeapSpace::new(young_size),
-            mature_space: HeapSpace::new(old_size),
+            young_space: YoungSpace::new(young_size),
+            mature_space: MatureSpace::new(old_size),
         }
     }
 
     /// Returns `true` if there is sufficient room in the young space to allocate an object of type
     /// `T`.
-    pub fn can_alloc<T: Trace>(&self) -> bool {
+    pub fn can_alloc_young<T: Trace>(&self) -> bool {
         self.young_space.can_alloc::<T>()
     }
 
-    pub fn alloc<T: Trace>(&self, value: T) -> Option<Gc<T>> {
+    pub fn alloc_young<T: Trace>(&self, value: T) -> Option<Gc<T>> {
         self.young_space
             .can_alloc::<T>()
             .then(|| self.young_space.alloc(value))
@@ -359,7 +390,7 @@ impl Heap {
             let root = unsafe { *entry.field };
             eprintln!("-- Processing root {root:p}");
 
-            if !self.young_space.contains(root.as_ptr()) {
+            if !self.young_space.0.contains(root.as_ptr()) {
                 eprintln!("Root {root:p} is not in the young space, skipping");
                 continue;
             }
@@ -378,24 +409,30 @@ impl Heap {
             );
         }
 
-        self.young_space.current.set(self.young_space.start);
+        //TODO: should be a reset() method or smth
+        self.young_space.0.current.set(self.young_space.0.start);
     }
 
     pub fn parse_young(&self) {
-        self.young_space.parse();
+        self.young_space.0.parse();
     }
 
     pub fn parse_mature(&self) {
-        self.mature_space.parse();
+        self.mature_space.0.parse();
     }
 }
+
+pub struct YoungSpace(HeapSpace);
+pub struct MatureSpace(HeapSpace);
 
 impl HeapSpace {
     pub fn new(size: usize) -> Self {
         unsafe {
-            let start = alloc(Layout::from_size_align(size, align_of::<u8>()).unwrap());
-            // We align `start` to the block header alignment for heap parsability
-            let start = align_up(start, align_of::<BlockHeader>());
+            assert!(
+                size >= size_of::<BlockHeader>(),
+                "heap size too small: a heap must be able to fit at least one block header"
+            );
+            let start = alloc(Layout::from_size_align(size, align_of::<BlockHeader>()).unwrap());
 
             let Some(start) = NonNull::new(start) else {
                 panic!("out of memory");
@@ -422,15 +459,43 @@ impl HeapSpace {
         unsafe { self.start.as_ptr().add(self.size) }
     }
 
+    fn iter(&self) -> impl std::iter::Iterator<Item = *mut BlockHeader> {
+        HeapSpaceIter {
+            curr: self.start.as_ptr(),
+            end: self.current.get().as_ptr(),
+        }
+    }
+
+    pub fn parse(&self) {
+        for ptr in self.iter() {
+            let header = unsafe { &*ptr };
+            println!("Next object: {} bytes (header @ {ptr:p})", header.size);
+        }
+    }
+
+    pub fn contains(&self, ptr: *const BlockHeader) -> bool {
+        let ptr = ptr as *const u8;
+        let start = self.start.as_ptr();
+
+        ptr >= start && ptr < self.end()
+    }
+}
+
+impl YoungSpace {
+    /// Creates a new young space with the given size.
+    pub fn new(size: usize) -> Self {
+        YoungSpace(HeapSpace::new(size))
+    }
+
     /// Checks if there is enough space to allocate a value of type `T` in this space. Same as
-    /// `self.can_alloc_layout(Layout::new::<T>())`.
+    /// `self.0.can_alloc_layout(Layout::new::<T>())`.
     pub fn can_alloc<T: Trace>(&self) -> bool {
         self.can_alloc_layout(Layout::new::<T>())
     }
 
     /// Checks if there is enough space to allocate a new object with a given layout in this space.
     pub fn can_alloc_layout(&self, layout: Layout) -> bool {
-        let current = self.current.get().as_ptr();
+        let current = self.0.current.get().as_ptr();
 
         // We are overly conservative with alignment padding and use an upper bound instead of
         // computing the exact value. It doesn't matter much for a few bytes.
@@ -439,25 +504,25 @@ impl HeapSpace {
             .wrapping_add(size_of::<BlockHeader>())
             .wrapping_add(align_of::<BlockHeader>() - 1)
             .wrapping_add(layout.align() - 1)
-            < self.end()
+            < self.0.end()
     }
 
     // /// Checks if there is enough space to allocate a new object as a copy of an existing one.
     // pub fn can_copy(&self, from: GcPtr) -> bool {
-    //     let current = self.current.get().as_ptr();
+    //     let current = self.0.current.get().as_ptr();
     //     let header = unsafe { from.start.as_ref() };
     //
-    //     current.wrapping_add(header.alloc_total_size()) < self.end()
+    //     current.wrapping_add(header.alloc_total_size()) < self.0.end()
     // }
 
     /// Allocates an object in this space, or returns `None` if the space is full.
     pub fn alloc<T: Trace>(&self, value: T) -> Gc<T> {
         let layout = Layout::new::<T>();
-        let current = self.current.get().as_ptr();
+        let current = self.0.current.get().as_ptr();
 
         if !self.can_alloc::<T>() {
             panic!("out of memory");
-            // return self.alloc(value);
+            // return self.0.alloc(value);
         }
 
         unsafe {
@@ -487,8 +552,8 @@ impl HeapSpace {
             // Safety: see the justification for the call to `align_up` above.
             // We maintain the  invariant that the next current pointer is `BlockHeader`-aligned.
             let next_slot = align_up(slot.add(layout.size()), align_of::<BlockHeader>());
-            // Safety: `next_slot` is an offset from the `self.current`, which is non null
-            self.current.set(NonNull::new_unchecked(next_slot));
+            // Safety: `next_slot` is an offset from the `self.0.current`, which is non null
+            self.0.current.set(NonNull::new_unchecked(next_slot));
 
             // Now that we have the total size of the allocated chunk including padding, we can
             // write the block header.
@@ -520,9 +585,10 @@ impl HeapSpace {
             }
         }
     }
+}
 
-    /// Copy an existing [GcPtr], potentially from a different space, to this space.
-    pub fn copy(&self, from: GcPtr) -> GcPtr {
+impl AllocSpace for YoungSpace {
+    fn copy(&self, from: GcPtr) -> GcPtr {
         let from_header = unsafe { from.start.as_ref() };
 
         let layout = {
@@ -534,7 +600,7 @@ impl HeapSpace {
             panic!("out of memory");
         }
 
-        let current = self.current.get().as_ptr();
+        let current = self.0.current.get().as_ptr();
 
         // See Self::alloc for safety and explanation. The following is just a simpler version of
         // allocation, where we copy chunks of the original object instead of writing new data.
@@ -547,7 +613,7 @@ impl HeapSpace {
             let slot = align_up(unaligned_slot, layout.align());
 
             let next_slot = align_up(slot.add(layout.size()), align_of::<BlockHeader>());
-            self.current.set(NonNull::new_unchecked(next_slot));
+            self.0.current.set(NonNull::new_unchecked(next_slot));
 
             // Now that we have the total size of the allocated chunk including padding, we can
             // write the block header.
@@ -580,26 +646,66 @@ impl HeapSpace {
             }
         }
     }
+}
 
-    fn iter(&self) -> impl std::iter::Iterator<Item = *mut BlockHeader> {
-        HeapSpaceIter {
-            curr: self.start.as_ptr(),
-            end: self.current.get().as_ptr(),
+impl MatureSpace {
+    pub fn new(size: usize) -> Self {
+        let space = HeapSpace::new(size);
+
+        unsafe {
+            Self::write_free_block(space.start.cast(), size, None);
         }
+
+        MatureSpace(space)
     }
 
-    pub fn parse(&self) {
-        for ptr in self.iter() {
-            let header = unsafe { &*ptr };
-            println!("Next object: {} bytes (header @ {ptr:p})", header.size);
-        }
+    /// TODO doc
+    ///
+    /// # Safety
+    ///
+    /// - `start` is valid, non-null pointer that can be written to
+    unsafe fn write_free_block(
+        start: NonNull<BlockHeader>,
+        size: usize,
+        next: Option<NonNull<BlockHeader>>,
+    ) {
+        start.write(BlockHeader::empty(size, next));
     }
 
-    pub fn contains(&self, ptr: *const BlockHeader) -> bool {
-        let ptr = ptr as *const u8;
-        let start = self.start.as_ptr();
+    /// Picks a free block at least as large as the given size for an allocation, and remove it
+    /// from the free list block.
+    fn find_fitting_block(&self, size: usize) -> Option<NonNull<BlockHeader>> {
+        let mut prev: Option<NonNull<BlockHeader>> = None;
+        let mut cursor = Some(self.0.current.get().cast::<BlockHeader>());
 
-        ptr >= start && ptr < self.end()
+        while let Some(curr) = cursor {
+            unsafe {
+                let header = curr.as_ref();
+                let BlockType::Free { next } = header.block_type else {
+                    unreachable!()
+                };
+
+                if header.size >= size {
+                    if let Some(mut prev) = prev {
+                        prev.as_mut().block_type = BlockType::Free { next };
+                    } else {
+                        self.0.current.set(todo!("what should we do if next.next is None? There won't be any more blocks in the list, but current isn't an optional"));
+                    }
+                    return cursor;
+                }
+
+                prev = cursor;
+                cursor = next;
+            }
+        }
+
+        None
+    }
+}
+
+impl AllocSpace for MatureSpace {
+    fn copy(&self, obj: GcPtr) -> GcPtr {
+        todo!()
     }
 }
 
@@ -693,11 +799,11 @@ impl MemoryManager {
     }
 
     pub fn root<T: Trace>(&mut self, heap: &Heap, value: T) -> GcIndex<T> {
-        if !heap.can_alloc::<T>() {
+        if !heap.can_alloc_young::<T>() {
             heap.collect(self);
         }
 
-        if let Some(alloced) = heap.alloc(value) {
+        if let Some(alloced) = heap.alloc_young(value) {
             self.memory.push(Some(alloced.as_gc_ptr()));
             GcIndex {
                 index: self.memory.len() - 1,
