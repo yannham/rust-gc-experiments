@@ -13,13 +13,10 @@ pub struct Heap {
     mature_space: MatureSpace,
 }
 
-/// A heap from- or to-space, that is a bump-allocated and automatically managed contiguous memory
-/// area.
+/// Contiguous allocated region of memory in the heap.
 pub struct HeapSpace {
     /// Pointer to the start of the young generation. This address is always `BlockHeader`-aligned.
     start: NonNull<u8>,
-    /// Pointer to the next free address. This address is always `BlockHeader`-aligned.
-    current: Cell<NonNull<u8>>,
     /// The size of the heap space in bytes.
     size: usize,
 }
@@ -145,6 +142,9 @@ pub struct BlockHeader {
     ///
     /// `size` is `e - b` when interpreted as memory addresses. This allow to jump to the next
     /// object in the heap without recomputing the size from the various paddings.
+    ///
+    /// This is the same for free blocks, considering that there's no padding.
+    //TODO: should we have size = e - a instead?
     size: usize,
     /// The padding between the header and the beginning of the object (`c - b` in the diagram
     /// describing [Self::size]).
@@ -243,6 +243,24 @@ impl BlockHeader {
     /// currently the last allocated.
     pub fn alloc_total_size(&self) -> usize {
         self.size + std::mem::size_of::<BlockHeader>()
+    }
+
+    /// Given a free block, checks that the block is big enough to store a value with the provided
+    /// layout, including potential padding.
+    pub fn can_store(&self, layout: Layout) -> bool {
+        assert!(matches!(self.block_type, BlockType::Free { .. }));
+
+        unsafe {
+            let self_ptr = self as *const BlockHeader;
+            let slot = align_up_cst(
+                self_ptr.add(size_of::<BlockHeader>()).cast(),
+                layout.align(),
+            );
+            assert!(layout.align() * size_of::<u8>() < (isize::MAX as usize));
+            let next_slot = align_up_cst(slot.add(layout.size()), align_of::<BlockHeader>());
+
+            (next_slot as usize) <= (self_ptr as usize) + size_of::<BlockHeader>() + self.size
+        }
     }
 }
 
@@ -390,7 +408,7 @@ impl Heap {
             let root = unsafe { *entry.field };
             eprintln!("-- Processing root {root:p}");
 
-            if !self.young_space.0.contains(root.as_ptr()) {
+            if !self.young_space.space.contains(root.as_ptr()) {
                 eprintln!("Root {root:p} is not in the young space, skipping");
                 continue;
             }
@@ -410,20 +428,29 @@ impl Heap {
         }
 
         //TODO: should be a reset() method or smth
-        self.young_space.0.current.set(self.young_space.0.start);
+        self.young_space.current.set(self.young_space.space.start);
     }
 
     pub fn parse_young(&self) {
-        self.young_space.0.parse();
+        self.young_space.parse();
     }
 
     pub fn parse_mature(&self) {
-        self.mature_space.0.parse();
+        self.mature_space.parse();
     }
 }
 
-pub struct YoungSpace(HeapSpace);
-pub struct MatureSpace(HeapSpace);
+pub struct YoungSpace {
+    space: HeapSpace,
+    /// Pointer to the next free address. This address is always `BlockHeader`-aligned.
+    current: Cell<NonNull<u8>>,
+}
+
+pub struct MatureSpace {
+    space: HeapSpace,
+    /// The head of the free list of blocks in this space.
+    next_free: Cell<Option<NonNull<BlockHeader>>>,
+}
 
 impl HeapSpace {
     pub fn new(size: usize) -> Self {
@@ -445,11 +472,7 @@ impl HeapSpace {
                 );
             }
 
-            Self {
-                start,
-                current: Cell::new(start),
-                size,
-            }
+            Self { start, size }
         }
     }
 
@@ -457,20 +480,6 @@ impl HeapSpace {
         // Safety: the end pointer is considered to be part of the allocation as per my current
         // understanding of the semantics of pointer provenance in Rust.
         unsafe { self.start.as_ptr().add(self.size) }
-    }
-
-    fn iter(&self) -> impl std::iter::Iterator<Item = *mut BlockHeader> {
-        HeapSpaceIter {
-            curr: self.start.as_ptr(),
-            end: self.current.get().as_ptr(),
-        }
-    }
-
-    pub fn parse(&self) {
-        for ptr in self.iter() {
-            let header = unsafe { &*ptr };
-            println!("Next object: {} bytes (header @ {ptr:p})", header.size);
-        }
     }
 
     pub fn contains(&self, ptr: *const BlockHeader) -> bool {
@@ -484,7 +493,12 @@ impl HeapSpace {
 impl YoungSpace {
     /// Creates a new young space with the given size.
     pub fn new(size: usize) -> Self {
-        YoungSpace(HeapSpace::new(size))
+        let space = HeapSpace::new(size);
+
+        YoungSpace {
+            current: Cell::new(space.start),
+            space,
+        }
     }
 
     /// Checks if there is enough space to allocate a value of type `T` in this space. Same as
@@ -495,7 +509,7 @@ impl YoungSpace {
 
     /// Checks if there is enough space to allocate a new object with a given layout in this space.
     pub fn can_alloc_layout(&self, layout: Layout) -> bool {
-        let current = self.0.current.get().as_ptr();
+        let current = self.current.get().as_ptr();
 
         // We are overly conservative with alignment padding and use an upper bound instead of
         // computing the exact value. It doesn't matter much for a few bytes.
@@ -504,7 +518,7 @@ impl YoungSpace {
             .wrapping_add(size_of::<BlockHeader>())
             .wrapping_add(align_of::<BlockHeader>() - 1)
             .wrapping_add(layout.align() - 1)
-            < self.0.end()
+            < self.space.end()
     }
 
     // /// Checks if there is enough space to allocate a new object as a copy of an existing one.
@@ -518,7 +532,7 @@ impl YoungSpace {
     /// Allocates an object in this space, or returns `None` if the space is full.
     pub fn alloc<T: Trace>(&self, value: T) -> Gc<T> {
         let layout = Layout::new::<T>();
-        let current = self.0.current.get().as_ptr();
+        let current = self.current.get().as_ptr();
 
         if !self.can_alloc::<T>() {
             panic!("out of memory");
@@ -553,7 +567,7 @@ impl YoungSpace {
             // We maintain the  invariant that the next current pointer is `BlockHeader`-aligned.
             let next_slot = align_up(slot.add(layout.size()), align_of::<BlockHeader>());
             // Safety: `next_slot` is an offset from the `self.0.current`, which is non null
-            self.0.current.set(NonNull::new_unchecked(next_slot));
+            self.current.set(NonNull::new_unchecked(next_slot));
 
             // Now that we have the total size of the allocated chunk including padding, we can
             // write the block header.
@@ -585,6 +599,20 @@ impl YoungSpace {
             }
         }
     }
+
+    fn iter(&self) -> impl std::iter::Iterator<Item = *mut BlockHeader> {
+        HeapSpaceIter {
+            curr: self.space.start.as_ptr(),
+            end: self.current.get().as_ptr(),
+        }
+    }
+
+    pub fn parse(&self) {
+        for ptr in self.iter() {
+            let header = unsafe { &*ptr };
+            println!("Next object: {} bytes (header @ {ptr:p})", header.size);
+        }
+    }
 }
 
 impl AllocSpace for YoungSpace {
@@ -600,7 +628,7 @@ impl AllocSpace for YoungSpace {
             panic!("out of memory");
         }
 
-        let current = self.0.current.get().as_ptr();
+        let current = self.current.get().as_ptr();
 
         // See Self::alloc for safety and explanation. The following is just a simpler version of
         // allocation, where we copy chunks of the original object instead of writing new data.
@@ -613,7 +641,7 @@ impl AllocSpace for YoungSpace {
             let slot = align_up(unaligned_slot, layout.align());
 
             let next_slot = align_up(slot.add(layout.size()), align_of::<BlockHeader>());
-            self.0.current.set(NonNull::new_unchecked(next_slot));
+            self.current.set(NonNull::new_unchecked(next_slot));
 
             // Now that we have the total size of the allocated chunk including padding, we can
             // write the block header.
@@ -656,7 +684,10 @@ impl MatureSpace {
             Self::write_free_block(space.start.cast(), size, None);
         }
 
-        MatureSpace(space)
+        MatureSpace {
+            next_free: Cell::new(Some(space.start.cast())),
+            space,
+        }
     }
 
     /// TODO doc
@@ -672,11 +703,11 @@ impl MatureSpace {
         start.write(BlockHeader::empty(size, next));
     }
 
-    /// Picks a free block at least as large as the given size for an allocation, and remove it
-    /// from the free list block.
-    fn find_fitting_block(&self, size: usize) -> Option<NonNull<BlockHeader>> {
+    /// Picks a free block large enough to store a value of , and
+    /// remove it from the free list block.
+    fn find_fitting_block(&self, layout: Layout) -> Option<NonNull<BlockHeader>> {
         let mut prev: Option<NonNull<BlockHeader>> = None;
-        let mut cursor = Some(self.0.current.get().cast::<BlockHeader>());
+        let mut cursor = self.next_free.get();
 
         while let Some(curr) = cursor {
             unsafe {
@@ -685,12 +716,13 @@ impl MatureSpace {
                     unreachable!()
                 };
 
-                if header.size >= size {
+                if header.can_store(layout) {
                     if let Some(mut prev) = prev {
                         prev.as_mut().block_type = BlockType::Free { next };
                     } else {
-                        self.0.current.set(todo!("what should we do if next.next is None? There won't be any more blocks in the list, but current isn't an optional"));
+                        self.next_free.set(next);
                     }
+
                     return cursor;
                 }
 
@@ -700,6 +732,69 @@ impl MatureSpace {
         }
 
         None
+    }
+
+    /// Split a free block in two parts, with the first part being large enough to accomodate for
+    /// the required data. The leftover is added back to the beginning of the free block list. If
+    /// this function succeeds, the block header at `free_block` is updated with new type, padding
+    /// and size information.
+    ///
+    /// # Panic
+    ///
+    /// Panics if the free block isn't large enough to allocate a value of size `size`.
+    fn split_block<T: Trace>(&self, free_block: NonNull<BlockHeader>) {
+        unsafe {
+            let layout = Layout::new::<T>();
+            let size = { free_block.as_ref().size };
+            assert!(free_block.as_ref().can_store(layout));
+
+            let unaligned_slot = free_block.as_ptr().add(size_of::<BlockHeader>());
+            let slot = align_up(unaligned_slot.cast(), layout.align());
+            assert!(layout.align() * size_of::<u8>() < (isize::MAX as usize));
+            let next_slot = align_up(slot.add(layout.size()), align_of::<BlockHeader>());
+
+            let left_size = (next_slot as usize) - (unaligned_slot as usize);
+            let leftover = size + (free_block.as_ptr() as usize) + size_of::<BlockHeader>()
+                - next_slot as usize;
+
+            let leftover = if leftover >= size_of::<BlockHeader>() + 1 {
+                let right_header =
+                    BlockHeader::empty(leftover - size_of::<BlockHeader>(), self.next_free.get());
+                let right_header_slot = next_slot as *mut BlockHeader;
+                right_header_slot.write(right_header);
+                self.next_free
+                    .set(Some(NonNull::new_unchecked(next_slot.cast())));
+
+                0
+            } else {
+                leftover
+            };
+
+            let left_header = free_block.as_ptr();
+
+            ptr::write(
+                left_header,
+                BlockHeader::new(
+                    left_size + leftover,
+                    layout.align(),
+                    (slot as usize) - (unaligned_slot as usize),
+                    (next_slot as usize) - (slot as usize + layout.size()) + leftover,
+                    |obj, stack| T::trace(&mut *(obj as *mut T), stack),
+                ),
+            );
+        }
+    }
+
+    pub fn parse(&self) {
+        for ptr in self.iter() {
+            let header = unsafe { &*ptr };
+            println!("Next object: {} bytes (header @ {ptr:p})", header.size);
+        }
+    }
+
+    fn iter(&self) -> impl std::iter::Iterator<Item = *mut BlockHeader> {
+        todo!("iter for mature space");
+        std::iter::empty()
     }
 }
 
@@ -738,6 +833,16 @@ impl std::iter::Iterator for HeapSpaceIter {
 ///
 /// Requires that `align` is a power of 2.
 unsafe fn align_up(ptr: *mut u8, align: usize) -> *mut u8 {
+    // 1. Extract the complement to `align` (same as 2 complement) of `remainder = ptr % align`.
+    //    That is `!remainder + 1` which is `align - remainder` if `remainder != 0`, or `align`
+    //    otherwise.
+    // 2. Take the modulo `align` again to get exactly `align - remainder`
+    // 3. Offset the ptr by this value
+    let offset = ((!(ptr as usize) & (align - 1)) + 1) & (align - 1);
+    ptr.add(offset)
+}
+
+unsafe fn align_up_cst(ptr: *const u8, align: usize) -> *const u8 {
     // 1. Extract the complement to `align` (same as 2 complement) of `remainder = ptr % align`.
     //    That is `!remainder + 1` which is `align - remainder` if `remainder != 0`, or `align`
     //    otherwise.
