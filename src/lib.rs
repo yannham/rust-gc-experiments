@@ -109,12 +109,14 @@ fn noop_tracer(_: *mut u8, _: &mut Vec<TraceEntry>) {}
 
 /// The two type of blocks (free or allocated). For free blocks, we include there the additional
 /// data of the next free block in the list, if any.
+#[derive(Debug)]
 pub enum BlockType {
     Allocated,
     Free { next: Option<NonNull<BlockHeader>> },
 }
 
 /// The header of a heap-allocated value.
+#[derive(Debug)]
 pub struct BlockHeader {
     /// The mark and sweep or the forwarded flag, depending on the space.
     mark_bit: bool,
@@ -252,10 +254,7 @@ impl BlockHeader {
 
         unsafe {
             let self_ptr = self as *const BlockHeader;
-            let slot = align_up_cst(
-                self_ptr.add(size_of::<BlockHeader>()).cast(),
-                layout.align(),
-            );
+            let slot = align_up_cst(self_ptr.add(1).cast(), layout.align());
             assert!(layout.align() * size_of::<u8>() < (isize::MAX as usize));
             let next_slot = align_up_cst(slot.add(layout.size()), align_of::<BlockHeader>());
 
@@ -328,6 +327,27 @@ impl<T: fmt::Debug> fmt::Debug for Gc<T> {
     }
 }
 
+// impl fmt::Debug for BlockHeader {
+//     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+//         write!(
+//             f,
+//             "BlockHeader {{ size: {}, align: {}, start_padding: {}, end_padding: {}, marked: {}, type: {} }}",
+//             self.size,
+//             self.align(),
+//             self.start_padding,
+//             self.end_padding,
+//             self.mark_bit,
+//             match &self.block_type {
+//                 BlockType::Allocated => "Allocated".to_string(),
+//                 BlockType::Free { next } => format!(
+//                     "Free {{ next: {} }}",
+//                     next.map_or("None".to_string(), |n| format!("{:p}", n))
+//                 ),
+//             }
+//         )
+//     }
+// }
+
 pub trait Trace {
     fn trace(&mut self, _stack: &mut Vec<TraceEntry>) {}
 }
@@ -354,6 +374,10 @@ impl Heap {
         self.young_space
             .can_alloc::<T>()
             .then(|| self.young_space.alloc(value))
+    }
+
+    pub fn alloc_mature<T: Trace>(&self, value: T) -> Option<Gc<T>> {
+        Some(self.mature_space.alloc(value))
     }
 
     /// Marking phase of the mark and sweep algorithm.
@@ -703,8 +727,8 @@ impl MatureSpace {
         start.write(BlockHeader::empty(size, next));
     }
 
-    /// Picks a free block large enough to store a value of , and
-    /// remove it from the free list block.
+    /// Picks a free block large enough to store a value with a given layout and removes it from
+    /// the free list block.
     fn find_fitting_block(&self, layout: Layout) -> Option<NonNull<BlockHeader>> {
         let mut prev: Option<NonNull<BlockHeader>> = None;
         let mut cursor = self.next_free.get();
@@ -734,10 +758,11 @@ impl MatureSpace {
         None
     }
 
-    /// Split a free block in two parts, with the first part being large enough to accomodate for
+    /// Splits a free block in two parts, with the first part being large enough to accomodate for
     /// the required data. The leftover is added back to the beginning of the free block list. If
     /// this function succeeds, the block header at `free_block` is updated with new type, padding
-    /// and size information.
+    /// and size information. If there's no leftover or not enough to write a proper block header,
+    /// no second block is created at all.
     ///
     /// # Panic
     ///
@@ -748,25 +773,40 @@ impl MatureSpace {
             let size = { free_block.as_ref().size };
             assert!(free_block.as_ref().can_store(layout));
 
-            let unaligned_slot = free_block.as_ptr().add(size_of::<BlockHeader>());
+            let unaligned_slot = free_block.as_ptr().add(1);
             let slot = align_up(unaligned_slot.cast(), layout.align());
-            assert!(layout.align() * size_of::<u8>() < (isize::MAX as usize));
-            let next_slot = align_up(slot.add(layout.size()), align_of::<BlockHeader>());
+            assert!(layout.align() < (isize::MAX as usize));
+            let next_header = align_up(slot.add(layout.size()), align_of::<BlockHeader>());
 
-            let left_size = (next_slot as usize) - (unaligned_slot as usize);
+            let left_size = (next_header as usize) - (unaligned_slot as usize);
+
             let leftover = size + (free_block.as_ptr() as usize) + size_of::<BlockHeader>()
-                - next_slot as usize;
+                - next_header as usize;
 
-            let leftover = if leftover >= size_of::<BlockHeader>() + 1 {
+            eprintln!("<split_block>:");
+            eprintln!("** free_block = {free_block:p}, unaligned_slot = {unaligned_slot:p}, slot = {slot:p}, next_header = {next_header:p}");
+
+            eprintln!("<split_block>: left_size = {left_size}, leftover = {leftover}");
+
+            // If the left-over is too small to make a proper block out of it (we need to write at
+            // least a header and have at least a byte to store data), we need to put those bytes
+            // back in the to-be-allocated block (in the padding).
+            let inner_fragmentation = if leftover >= size_of::<BlockHeader>() + 1 {
                 let right_header =
                     BlockHeader::empty(leftover - size_of::<BlockHeader>(), self.next_free.get());
-                let right_header_slot = next_slot as *mut BlockHeader;
+                let right_header_slot = next_header as *mut BlockHeader;
                 right_header_slot.write(right_header);
                 self.next_free
-                    .set(Some(NonNull::new_unchecked(next_slot.cast())));
+                    .set(Some(NonNull::new_unchecked(next_header.cast())));
 
+                eprintln!(
+                    "<split_block>: split off chunk {:p}: {:?}",
+                    self.next_free.get().unwrap(),
+                    self.next_free.get().unwrap().as_ref()
+                );
                 0
             } else {
+                eprintln!("<split_block>: leftover too small to make a block ({leftover}), putting it back in");
                 leftover
             };
 
@@ -775,13 +815,43 @@ impl MatureSpace {
             ptr::write(
                 left_header,
                 BlockHeader::new(
-                    left_size + leftover,
+                    left_size + inner_fragmentation,
                     layout.align(),
                     (slot as usize) - (unaligned_slot as usize),
-                    (next_slot as usize) - (slot as usize + layout.size()) + leftover,
+                    (next_header as usize) - (slot as usize + layout.size()) + inner_fragmentation,
                     |obj, stack| T::trace(&mut *(obj as *mut T), stack),
                 ),
             );
+        }
+    }
+
+    /// Allocates an object in this space, or returns `None` if the space is full.
+    pub fn alloc<T: Trace>(&self, data: T) -> Gc<T> {
+        let Some(free_block) = self.find_fitting_block(Layout::new::<T>()) else {
+            todo!("no space left; trigger a GC");
+        };
+
+        eprintln!(
+            "<alloc>: splitting block at {free_block:p} of size {}",
+            unsafe { free_block.as_ref().size }
+        );
+        self.split_block::<T>(free_block);
+        eprintln!("<alloc>: block after splitting {:?}", unsafe {
+            free_block.as_ref()
+        });
+
+        unsafe {
+            let align = Layout::new::<T>().align();
+            let unaligned_slot = free_block.as_ptr().add(1).cast();
+            assert!(align * size_of::<u8>() < (isize::MAX as usize));
+            let slot = align_up(unaligned_slot, align);
+
+            ptr::write(slot as *mut T, data);
+
+            Gc {
+                start: free_block,
+                _marker: std::marker::PhantomData,
+            }
         }
     }
 
@@ -793,8 +863,10 @@ impl MatureSpace {
     }
 
     fn iter(&self) -> impl std::iter::Iterator<Item = *mut BlockHeader> {
-        todo!("iter for mature space");
-        std::iter::empty()
+        HeapSpaceIter {
+            curr: self.space.start.as_ptr(),
+            end: self.space.end(),
+        }
     }
 }
 
