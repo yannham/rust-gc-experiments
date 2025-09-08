@@ -30,7 +30,8 @@ pub struct TraceEntry {
 }
 
 pub trait AllocSpace {
-    /// Copy an existing [GcPtr], potentially from a different space, to this space.
+    /// Copy the content of an existing [GcPtr], potentially from a different space, to this space.
+    /// This creates a new distinct [GcPtr].
     fn copy(&self, obj: GcPtr) -> GcPtr;
 }
 
@@ -783,10 +784,8 @@ impl MatureSpace {
             let leftover = size + (free_block.as_ptr() as usize) + size_of::<BlockHeader>()
                 - next_header as usize;
 
-            eprintln!("<split_block>:");
-            eprintln!("** free_block = {free_block:p}, unaligned_slot = {unaligned_slot:p}, slot = {slot:p}, next_header = {next_header:p}");
-
-            eprintln!("<split_block>: left_size = {left_size}, leftover = {leftover}");
+            eprintln!("split_block()\n** free_block = {free_block:p}, unaligned_slot = {unaligned_slot:p}, slot = {slot:p}, next_header = {next_header:p}");
+            eprintln!("** left_size = {left_size}, leftover = {leftover}");
 
             // If the left-over is too small to make a proper block out of it (we need to write at
             // least a header and have at least a byte to store data), we need to put those bytes
@@ -800,13 +799,13 @@ impl MatureSpace {
                     .set(Some(NonNull::new_unchecked(next_header.cast())));
 
                 eprintln!(
-                    "<split_block>: split off chunk {:p}: {:?}",
+                    "split_block(): split off chunk {:p}: {:?}",
                     self.next_free.get().unwrap(),
                     self.next_free.get().unwrap().as_ref()
                 );
                 0
             } else {
-                eprintln!("<split_block>: leftover too small to make a block ({leftover}), putting it back in");
+                eprintln!("split_block(): leftover too small to make a block ({leftover}), putting it back in");
                 leftover
             };
 
@@ -832,11 +831,11 @@ impl MatureSpace {
         };
 
         eprintln!(
-            "<alloc>: splitting block at {free_block:p} of size {}",
+            "alloc(): splitting block at {free_block:p} of size {}",
             unsafe { free_block.as_ref().size }
         );
         self.split_block::<T>(free_block);
-        eprintln!("<alloc>: block after splitting {:?}", unsafe {
+        eprintln!("alloc(): block after splitting {:?}", unsafe {
             free_block.as_ref()
         });
 
