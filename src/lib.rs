@@ -8,9 +8,9 @@ use std::ptr::{self, NonNull};
 /// The garbage-collected heap.
 pub struct Heap {
     /// The space for allocating new objects.
-    young_space: YoungSpace,
+    pub(crate) young_space: YoungSpace,
     /// The space for evacuating objets that survived a young collection.
-    mature_space: MatureSpace,
+    pub(crate) mature_space: MatureSpace,
 }
 
 /// Contiguous allocated region of memory in the heap.
@@ -381,55 +381,12 @@ impl Heap {
         Some(self.mature_space.alloc(value))
     }
 
-    /// Marking phase of the mark and sweep algorithm.
-    fn mark(&self, stack: &mut MemoryManager) {
-        for entry in stack.iter_as_trace_entries() {
-            let root = unsafe { *entry.field };
-            eprintln!("Tracing root {root:p}");
-
-            let header = unsafe { &mut *(root.as_ptr() as *mut BlockHeader) };
-            debug_assert!(
-                !header.is_marked(),
-                "roots should always be unmarked at the beginning of the tracing phase"
-            );
-            // Safety: `gc_ptr` is a valid GcPtr created from a mutable reference (that isn't used
-            // anymore).
-            unsafe { entry.mark() }
-        }
-    }
-
-    //   pub fn sweep(&self) {
-    //       let mut ptr = self.start.as_ptr();
-    //       let end = self.current.get().as_ptr();
-    //
-    //       unsafe {
-    //           while ptr < end {
-    //               let header = &mut *(ptr as *mut BlockHeader);
-    //               if header.is_marked() {
-    //                   println!("Object {ptr:p} is marked. Keeping and unmarking");
-    //                   header.unmark();
-    //               } else {
-    //                   println!("Object {ptr:p} is unmarked. Sweeping (in principle, currently unimplemented)");
-    //               }
-    //
-    //               println!("Next object: {} bytes (header @ {ptr:p})", header.size());
-    //               ptr = ptr.wrapping_add(header.size() + size_of::<BlockHeader>());
-    //           }
-    //       }
-    //   }
-
-    //   pub fn collect(&self) {
-    //       self.trace();
-    //       self.sweep();
-    //   }
-
-    pub fn collect(&self, stack: &mut MemoryManager) {
-        // We don't collect the old generation for now.
-        self.collect_young(stack);
+    pub fn collect_mature(&self, stack: &mut MemoryManager) {
+        self.mature_space.collect(stack);
     }
 
     pub fn collect_young(&self, stack: &mut MemoryManager) {
-        for entry in stack.iter_as_trace_entries() {
+        for entry in stack.iter_mut_as_trace_entries() {
             let root = unsafe { *entry.field };
             eprintln!("-- Processing root {root:p}");
 
@@ -635,7 +592,10 @@ impl YoungSpace {
     pub fn parse(&self) {
         for ptr in self.iter() {
             let header = unsafe { &*ptr };
-            println!("Next object: {} bytes (header @ {ptr:p})", header.size);
+            println!(
+                "Next object: {} bytes (header @ {ptr:p}), type: {:?}",
+                header.size, header.block_type
+            );
         }
     }
 }
@@ -854,10 +814,27 @@ impl MatureSpace {
         }
     }
 
+    /// De-allocates a block. Caution: currently this doesn't call [Drop::drop], so any heap-allocated
+    /// memory will leak. This is to be fixed in the future.
+    ///
+    /// # Safety
+    ///
+    /// The backing memory will be de-allocated. The content of the block must thus be "drop-safe"
+    /// (not aliased, etc.).
+    pub unsafe fn free(&self, mut ptr: NonNull<BlockHeader>) {
+        let header = ptr.as_mut();
+        //TODO: merge with the following block if it's empty
+        *header = BlockHeader::empty(header.size, self.next_free.get());
+        self.next_free.set(Some(ptr));
+    }
+
     pub fn parse(&self) {
         for ptr in self.iter() {
             let header = unsafe { &*ptr };
-            println!("Next object: {} bytes (header @ {ptr:p})", header.size);
+            println!(
+                "Next object: {} bytes (header @ {ptr:p}), type: {:?}",
+                header.size, header.block_type
+            );
         }
     }
 
@@ -866,6 +843,55 @@ impl MatureSpace {
             curr: self.space.start.as_ptr(),
             end: self.space.end(),
         }
+    }
+
+    /// Marking phase of the mark and sweep algorithm. `stack` is providing the list of roots
+    /// through [MemoryManager].
+    fn mark(&self, stack: &mut MemoryManager) {
+        for entry in stack.iter_mut_as_trace_entries() {
+            let root = unsafe { *entry.field };
+            eprintln!("Tracing root {root:p}");
+
+            let header = unsafe { &mut *(root.as_ptr() as *mut BlockHeader) };
+            debug_assert!(
+                !header.is_marked(),
+                "roots should always be unmarked at the beginning of the tracing phase"
+            );
+            // Safety: `gc_ptr` is a valid GcPtr created from a mutable reference (that isn't used
+            // anymore).
+            unsafe { entry.mark() }
+        }
+    }
+
+    /// Sweeping phase of the mark and sweep algorithm. Free all unmarked blocks, and unmark
+    /// previously marked blocks, preparing for the next collection.
+    pub fn sweep(&self) {
+        let mut ptr = self.space.start.as_ptr();
+        let end = self.space.end();
+
+        unsafe {
+            while ptr < end {
+                // unwrap(): No pointer in the range [start, end] is null
+                let header = ptr.cast::<BlockHeader>().as_mut().unwrap();
+                if header.is_marked() {
+                    println!("Object {ptr:p} is marked. Keeping and unmarking");
+                    header.unmark();
+                }
+                // We must be aware of not freeing already free blocks, which would corrupt the
+                // free block list.
+                else if matches!(header.block_type, BlockType::Allocated { .. }) {
+                    self.free(header.into());
+                }
+
+                println!("Next object: {} bytes (header @ {ptr:p})", header.size);
+                ptr = ptr.wrapping_add(header.size + size_of::<BlockHeader>());
+            }
+        }
+    }
+
+    pub fn collect(&self, roots: &mut MemoryManager) {
+        self.mark(roots);
+        self.sweep();
     }
 }
 
@@ -975,11 +1001,11 @@ impl MemoryManager {
     }
 
     pub fn root<T: Trace>(&mut self, heap: &Heap, value: T) -> GcIndex<T> {
-        if !heap.can_alloc_young::<T>() {
-            heap.collect(self);
-        }
+        // if !heap.can_alloc_young::<T>() {
+        //     heap.collect_young(self);
+        // }
 
-        if let Some(alloced) = heap.alloc_young(value) {
+        if let Some(alloced) = heap.alloc_mature(value) {
             self.memory.push(Some(alloced.as_gc_ptr()));
             GcIndex {
                 index: self.memory.len() - 1,
@@ -1009,7 +1035,7 @@ impl MemoryManager {
     }
 
     /// Iterate over the live roots of this memory manager seen as trace entries.
-    fn iter_as_trace_entries(&mut self) -> impl Iterator<Item = TraceEntry> + '_ {
+    fn iter_mut_as_trace_entries(&mut self) -> impl Iterator<Item = TraceEntry> + '_ {
         self.iter_mut().map(|gc_ptr| TraceEntry {
             field: &mut gc_ptr.start as *mut NonNull<BlockHeader>,
         })
