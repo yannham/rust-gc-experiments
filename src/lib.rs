@@ -262,6 +262,22 @@ impl BlockHeader {
             (next_slot as usize) <= (self_ptr as usize) + size_of::<BlockHeader>() + self.size
         }
     }
+
+    /// Returns the pointer to the beginning of the data stored in this block.
+    pub fn data_ptr(this: NonNull<BlockHeader>) -> Option<NonNull<u8>> {
+        unsafe {
+                let block_ref = this.as_ref();
+
+                if matches!(block_ref.block_type, BlockType::Free { .. }) {
+                    return None; 
+                }
+            
+                let padding = block_ref.start_padding;
+
+            let this_u8 : NonNull<u8> = this.cast();
+            Some(this_u8.add(size_of::<BlockHeader>() + (padding as usize)))
+        }
+    }
 }
 
 pub struct Gc<T> {
@@ -349,8 +365,17 @@ impl<T: fmt::Debug> fmt::Debug for Gc<T> {
 //     }
 // }
 
-pub trait Trace {
+pub trait Trace: Sized {
     fn trace(&mut self, _stack: &mut Vec<TraceEntry>) {}
+
+    // If needed, we could move the `Sized` bound here, it at some point we have a DST and we want
+    // to implement only `trace_untyped` directly.
+    fn trace_untyped(this: *mut u8, stack: &mut Vec<TraceEntry>) {
+        unsafe {
+            let this = &mut *(this as *mut Self);
+            this.trace(stack);
+        }
+    }
 }
 
 impl Trace for usize {}
@@ -719,6 +744,10 @@ impl MatureSpace {
         None
     }
 
+    fn split_block<T: Trace>(&self, free_block: NonNull<BlockHeader>) {
+        self.split_block_untyped(free_block, Layout::new::<T>(), T::trace_untyped)
+    }
+
     /// Splits a free block in two parts, with the first part being large enough to accomodate for
     /// the required data. The leftover is added back to the beginning of the free block list. If
     /// this function succeeds, the block header at `free_block` is updated with new type, padding
@@ -728,9 +757,8 @@ impl MatureSpace {
     /// # Panic
     ///
     /// Panics if the free block isn't large enough to allocate a value of size `size`.
-    fn split_block<T: Trace>(&self, free_block: NonNull<BlockHeader>) {
+    fn split_block_untyped(&self, free_block: NonNull<BlockHeader>, layout: Layout, tracer: Tracer) {
         unsafe {
-            let layout = Layout::new::<T>();
             let size = { free_block.as_ref().size };
             assert!(free_block.as_ref().can_store(layout));
 
@@ -778,7 +806,7 @@ impl MatureSpace {
                     layout.align(),
                     (slot as usize) - (unaligned_slot as usize),
                     (next_header as usize) - (slot as usize + layout.size()) + inner_fragmentation,
-                    |obj, stack| T::trace(&mut *(obj as *mut T), stack),
+                    tracer,
                 ),
             );
         }
@@ -897,7 +925,39 @@ impl MatureSpace {
 
 impl AllocSpace for MatureSpace {
     fn copy(&self, obj: GcPtr) -> GcPtr {
-        todo!()
+        let Some(free_block) = self.find_fitting_block(Layout::new::<T>()) else {
+            todo!("no space left; trigger a GC");
+        };
+
+        eprintln!(
+            "alloc(): splitting block at {free_block:p} of size {}",
+            unsafe { free_block.as_ref().size }
+        );
+
+        let layout = todo!();
+        let tracer = todo!();
+
+        self.split_block_untyped(free_block, layout, tracer);
+
+        eprintln!("alloc(): block after splitting {:?}", unsafe {
+            free_block.as_ref()
+        });
+
+        unsafe {
+            let align = layout.align();
+            let unaligned_slot = free_block.as_ptr().add(1).cast();
+            assert!(align * size_of::<u8>() < (isize::MAX as usize));
+            let slot = align_up(unaligned_slot, align);
+
+            assert!(!self.space.contains(obj.start.as_ptr()));
+            ptr::copy_nonoverlapping(obj.start.add())
+            ptr::write(slot as *mut T, data);
+
+            Gc {
+                start: free_block,
+                _marker: std::marker::PhantomData,
+            }
+        }
     }
 }
 
