@@ -87,22 +87,34 @@ fn main() {
     // overwritten!
 
     eprintln!("State before first collection");
-    eprintln!("-- Mature");
-    heap.parse_mature();
+    eprintln!("-- Young");
+    heap.parse_young();
 
     eprintln!("\nMemoryManager state: {manager:?}");
 
-    eprintln!("\nFirst collection");
-    heap.collect_mature(&mut manager);
+    eprintln!("\n\nFirst collection");
+    heap.collect_young(&mut manager);
 
     eprintln!("State after first collection");
+    eprintln!("-- Young");
+    heap.parse_young();
     eprintln!("-- Mature");
     heap.parse_mature();
 
-    eprintln!("\nSecond collection");
+    let bar_after_collect = manager.get(bar_idx);
+    let foo_after_collect = manager.get(foo_struct_idx);
+    eprintln!("Alive data pointers after moving: {bar_after_collect:p}, {baz_deps_after_collect:p}, {foo_after_collect:p}", baz_deps_after_collect = foo_after_collect.thd);
+    eprintln!("Alive data after moving: {bar_after_collect:?}, and {foo_after_collect:?}");
+
+    manager.unroot(foo_struct_idx);
+
+    eprintln!("\n\nSecond collection");
+    heap.collect_young(&mut manager);
     heap.collect_mature(&mut manager);
 
     eprintln!("\nState after second collection");
+    eprintln!("-- Young");
+    heap.parse_young();
     eprintln!("-- Mature");
     heap.parse_mature();
 
@@ -112,21 +124,25 @@ fn main() {
     let gen2_one_usize = manager.root(&heap, 1usize);
     let gen2_snd_usize = manager.root(&heap, 2usize);
 
-    eprintln!("\nState after re-allocation");
+    eprintln!("\n\nState after re-allocation");
+    eprintln!("-- Young");
+    heap.parse_young();
     eprintln!("-- Mature");
     heap.parse_mature();
 
     manager.unroot(gen2_one_usize);
     manager.unroot(gen2_string);
 
-    heap.collect_mature(&mut manager);
+    heap.collect_young(&mut manager);
 
-    eprintln!("\nState after third collection");
+    eprintln!("\n\nState after third collection");
+    eprintln!("-- Young");
+    heap.parse_young();
     eprintln!("-- Mature");
     heap.parse_mature();
 
-    let foo_after_collect = manager.get(foo_struct_idx);
+    // let foo_after_collect = manager.get(foo_struct_idx);
     let bar_after_collect = manager.get(bar_idx);
-    eprintln!("Alive data pointers after moving: {bar_after_collect:p}, {baz_deps_after_collect:p}, {foo_after_collect:p}", baz_deps_after_collect = foo_after_collect.thd);
-    eprintln!("Alive data after moving: {bar_after_collect:?}, and {foo_after_collect:?}")
+    eprintln!("Alive data pointers after moving: {bar_after_collect:p}");
+    eprintln!("Alive data after moving: {bar_after_collect:?}")
 }

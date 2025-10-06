@@ -55,16 +55,15 @@ impl TraceEntry {
             // Thus the `add` operation sill end up within the bounds of the heap space.
             let start = unsafe { (*field).as_ptr() };
             let header = unsafe { &mut *start };
-            let value = unsafe {
-                (start as *mut u8).add(size_of::<BlockHeader>() + (header.start_padding as usize))
-            };
+            // unwrap(): we assume that we don't call `mark` on empty blocks
+            let value = unsafe { BlockHeader::data_ptr(*field).unwrap() };
 
             if header.is_marked() {
                 continue;
             }
 
             header.mark();
-            (header.tracer)(value, &mut stack);
+            (header.tracer)(value.as_ptr(), &mut stack);
         }
     }
 
@@ -87,9 +86,8 @@ impl TraceEntry {
                 let to_addr = to_space.copy(GcPtr { start: pointee });
                 let to_header = &*(to_addr.start.as_ptr());
                 from_header.forward(to_addr);
-                let to_value = (to_addr.start.as_ptr() as *mut u8)
-                    .add(size_of::<BlockHeader>() + (to_header.start_padding as usize));
-                (to_header.tracer)(to_value, &mut stack);
+                let to_value = to_addr.data_ptr();
+                (to_header.tracer)(to_value.as_ptr(), &mut stack);
                 to_addr
             });
 
@@ -266,17 +264,28 @@ impl BlockHeader {
     /// Returns the pointer to the beginning of the data stored in this block.
     pub fn data_ptr(this: NonNull<BlockHeader>) -> Option<NonNull<u8>> {
         unsafe {
-                let block_ref = this.as_ref();
+            let block_ref = this.as_ref();
 
-                if matches!(block_ref.block_type, BlockType::Free { .. }) {
-                    return None; 
-                }
-            
-                let padding = block_ref.start_padding;
+            if matches!(block_ref.block_type, BlockType::Free { .. }) {
+                return None;
+            }
 
-            let this_u8 : NonNull<u8> = this.cast();
+            let padding = block_ref.start_padding;
+
+            let this_u8: NonNull<u8> = this.cast();
             Some(this_u8.add(size_of::<BlockHeader>() + (padding as usize)))
         }
+    }
+
+    /// Returns the layout of the object stored in this block. If the block is empty, returns
+    /// `None`.
+    pub fn layout(&self) -> Option<Layout> {
+        if let BlockType::Free { .. } = self.block_type {
+            return None;
+        }
+
+        let size = self.size - (self.start_padding as usize) - (self.end_padding as usize);
+        Some(Layout::from_size_align(size, self.align()).unwrap())
     }
 }
 
@@ -290,6 +299,12 @@ pub struct GcPtr {
     start: NonNull<BlockHeader>,
 }
 
+impl GcPtr {
+    pub fn data_ptr(&self) -> NonNull<u8> {
+        BlockHeader::data_ptr(self.start).unwrap()
+    }
+}
+
 impl std::fmt::Debug for GcPtr {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(f, "GcPtr({:p})", self.start)
@@ -299,6 +314,10 @@ impl std::fmt::Debug for GcPtr {
 impl<T> Gc<T> {
     pub fn as_gc_ptr(&self) -> GcPtr {
         GcPtr { start: self.start }
+    }
+
+    pub fn data_ptr(&self) -> NonNull<u8> {
+        self.as_gc_ptr().data_ptr()
     }
 
     pub fn as_trace_entry(&mut self) -> TraceEntry {
@@ -330,9 +349,7 @@ impl<T> Deref for Gc<T> {
 
     fn deref(&self) -> &T {
         unsafe {
-            let header = &*self.start.as_ptr();
-            let value = (self.start.as_ptr() as *const u8)
-                .add(size_of::<BlockHeader>() + (header.start_padding as usize));
+            let value = self.data_ptr().as_ptr();
             &*(value as *const T)
         }
     }
@@ -671,13 +688,12 @@ impl AllocSpace for YoungSpace {
                 ),
             );
 
-            let from_content_start = (from.start.as_ptr() as *const u8)
-                .add(size_of::<BlockHeader>() + (from_header.start_padding as usize));
+            let from_content_start = from.data_ptr();
             // The size of the content only
             let content_size = from_header.size
                 - (from_header.start_padding as usize)
                 - (from_header.end_padding as usize);
-            std::ptr::copy(from_content_start, slot, content_size);
+            std::ptr::copy(from_content_start.as_ptr(), slot, content_size);
 
             GcPtr {
                 start: NonNull::new_unchecked(current as *mut BlockHeader),
@@ -757,7 +773,12 @@ impl MatureSpace {
     /// # Panic
     ///
     /// Panics if the free block isn't large enough to allocate a value of size `size`.
-    fn split_block_untyped(&self, free_block: NonNull<BlockHeader>, layout: Layout, tracer: Tracer) {
+    fn split_block_untyped(
+        &self,
+        free_block: NonNull<BlockHeader>,
+        layout: Layout,
+        tracer: Tracer,
+    ) {
         unsafe {
             let size = { free_block.as_ref().size };
             assert!(free_block.as_ref().can_store(layout));
@@ -925,7 +946,10 @@ impl MatureSpace {
 
 impl AllocSpace for MatureSpace {
     fn copy(&self, obj: GcPtr) -> GcPtr {
-        let Some(free_block) = self.find_fitting_block(Layout::new::<T>()) else {
+        // Safety: `obj.start` is a valid, "unaliased" pointer to a block header
+        // unwrap(): a `GcPtr` shouldn't point to an empty block
+        let layout = unsafe { obj.start.as_ref().layout().unwrap() };
+        let Some(free_block) = self.find_fitting_block(layout) else {
             todo!("no space left; trigger a GC");
         };
 
@@ -934,9 +958,7 @@ impl AllocSpace for MatureSpace {
             unsafe { free_block.as_ref().size }
         );
 
-        let layout = todo!();
-        let tracer = todo!();
-
+        let tracer = unsafe { obj.start.as_ref().tracer };
         self.split_block_untyped(free_block, layout, tracer);
 
         eprintln!("alloc(): block after splitting {:?}", unsafe {
@@ -949,14 +971,11 @@ impl AllocSpace for MatureSpace {
             assert!(align * size_of::<u8>() < (isize::MAX as usize));
             let slot = align_up(unaligned_slot, align);
 
+            // Shouldn't be needed: a free block should never overlap with an allocated block
             assert!(!self.space.contains(obj.start.as_ptr()));
-            ptr::copy_nonoverlapping(obj.start.add())
-            ptr::write(slot as *mut T, data);
+            ptr::copy_nonoverlapping(obj.data_ptr().as_ptr(), slot, layout.size());
 
-            Gc {
-                start: free_block,
-                _marker: std::marker::PhantomData,
-            }
+            GcPtr { start: free_block }
         }
     }
 }
@@ -1061,11 +1080,11 @@ impl MemoryManager {
     }
 
     pub fn root<T: Trace>(&mut self, heap: &Heap, value: T) -> GcIndex<T> {
-        // if !heap.can_alloc_young::<T>() {
-        //     heap.collect_young(self);
-        // }
+        if !heap.can_alloc_young::<T>() {
+            heap.collect_young(self);
+        }
 
-        if let Some(alloced) = heap.alloc_mature(value) {
+        if let Some(alloced) = heap.alloc_young(value) {
             self.memory.push(Some(alloced.as_gc_ptr()));
             GcIndex {
                 index: self.memory.len() - 1,
