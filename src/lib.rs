@@ -1,9 +1,13 @@
 use std::alloc::{alloc, Layout};
 use std::cell::Cell;
 use std::fmt;
+use std::marker::PhantomData;
 use std::mem::align_of;
 use std::ops::Deref;
 use std::ptr::{self, NonNull};
+
+#[cfg(test)]
+mod tests;
 
 /// The garbage-collected heap.
 pub struct Heap {
@@ -291,7 +295,7 @@ impl BlockHeader {
 
 pub struct Gc<T> {
     start: NonNull<BlockHeader>,
-    _marker: std::marker::PhantomData<T>,
+    _marker: PhantomData<T>,
 }
 
 #[derive(Clone, Copy)]
@@ -325,6 +329,18 @@ impl<T> Gc<T> {
             field: &mut self.start as *mut NonNull<BlockHeader>,
         }
     }
+
+    /// Casts an  "untyped" [GcPtr] to [Self].
+    ///
+    /// # Safety
+    ///
+    /// The type of the object actually stored in the GC allocation must be `T`.
+    pub unsafe fn from_gc_ptr(gc_ptr: GcPtr) -> Self {
+        Gc {
+            start: gc_ptr.start,
+            _marker: PhantomData,
+        }
+    }
 }
 
 impl<T> From<&Gc<T>> for GcPtr {
@@ -337,7 +353,7 @@ impl<T> Clone for Gc<T> {
     fn clone(&self) -> Self {
         Self {
             start: self.start,
-            _marker: std::marker::PhantomData,
+            _marker: PhantomData,
         }
     }
 }
@@ -619,7 +635,7 @@ impl YoungSpace {
 
             Gc {
                 start: NonNull::new_unchecked(header_ptr),
-                _marker: std::marker::PhantomData,
+                _marker: PhantomData,
             }
         }
     }
@@ -858,7 +874,7 @@ impl MatureSpace {
 
             Gc {
                 start: free_block,
-                _marker: std::marker::PhantomData,
+                _marker: PhantomData,
             }
         }
     }
@@ -1052,14 +1068,14 @@ pub struct MemoryManager {
 /// object of the original type.
 pub struct GcIndex<T> {
     index: usize,
-    _marker: std::marker::PhantomData<T>,
+    _marker: PhantomData<T>,
 }
 
 impl<T> Clone for GcIndex<T> {
     fn clone(&self) -> Self {
         Self {
             index: self.index.clone(),
-            _marker: std::marker::PhantomData,
+            _marker: PhantomData,
         }
     }
 }
@@ -1075,6 +1091,13 @@ impl MemoryManager {
         self.memory.iter().copied().filter_map(|ptr| ptr)
     }
 
+    pub fn iter_index(&self) -> impl Iterator<Item = usize> + '_ {
+        self.memory
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, ptr)| ptr.is_some().then_some(idx))
+    }
+
     pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut GcPtr> {
         self.memory.iter_mut().filter_map(|ptr| ptr.as_mut())
     }
@@ -1088,7 +1111,7 @@ impl MemoryManager {
             self.memory.push(Some(alloced.as_gc_ptr()));
             GcIndex {
                 index: self.memory.len() - 1,
-                _marker: std::marker::PhantomData,
+                _marker: PhantomData,
             }
         } else {
             panic!("out of memory")
@@ -1096,16 +1119,23 @@ impl MemoryManager {
     }
 
     pub fn unroot<T>(&mut self, index: GcIndex<T>) -> bool {
-        let slot = &mut self.memory[index.index];
+        self.unroot_index(index.index)
+    }
+
+    /// # Panics
+    ///
+    /// Panics if the index is out of bound for this manager.
+    pub fn unroot_index(&mut self, index: usize) -> bool {
+        let slot = &mut self.memory[index];
         let was_alloced = slot.is_some();
-        self.memory[index.index] = None;
+        self.memory[index] = None;
         was_alloced
     }
 
     pub fn get_weak<T>(&self, index: GcIndex<T>) -> Option<Gc<T>> {
         self.memory[index.index].map(|ptr| Gc {
             start: ptr.start,
-            _marker: std::marker::PhantomData,
+            _marker: PhantomData,
         })
     }
 

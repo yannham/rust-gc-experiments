@@ -10,3 +10,5 @@ categories = ["memory-management"]
 edition = "2021"
 
 [dependencies]
+arbitrary = {version = "1.4.2", features = [ "derive" ]}
+arbtest = "0.3.2"
