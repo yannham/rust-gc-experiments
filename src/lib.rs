@@ -82,16 +82,28 @@ impl TraceEntry {
 
         while let Some(TraceEntry { field }) = stack.pop() {
             let pointee = unsafe { *field };
-            eprintln!("Evacuate loop: processing {field:p} -> {:p}", pointee);
+            eprintln!("Evacuate loop: processing {field:p} -> {pointee:p}");
 
-            let from_header = unsafe { &mut *(pointee.as_ptr()) };
+            let forwarding_addr = unsafe {
+                let from_header = &mut (*pointee.as_ptr());
+                from_header.forwarding_addr()
+            };
 
-            let new_addr = from_header.forwarding_addr().unwrap_or_else(|| unsafe {
+            if let Some(forwarding_addr) = forwarding_addr {
+                eprintln!("Found forwarding address {forwarding_addr:p}");
+            }
+
+            let new_addr = forwarding_addr.unwrap_or_else(|| unsafe {
                 let to_addr = to_space.copy(GcPtr { start: pointee });
-                let to_header = &*(to_addr.start.as_ptr());
-                from_header.forward(to_addr);
+                {
+                    let from_header = &mut (*pointee.as_ptr());
+                    from_header.forward(to_addr);
+                }
                 let to_value = to_addr.data_ptr();
-                (to_header.tracer)(to_value.as_ptr(), &mut stack);
+                {
+                    let to_header = &*(to_addr.start.as_ptr());
+                    (to_header.tracer)(to_value.as_ptr(), &mut stack);
+                }
                 to_addr
             });
 
@@ -212,16 +224,20 @@ impl BlockHeader {
 
     /// Check if this block is marked.
     pub fn is_marked(&self) -> bool {
-        eprintln!("Size: {} bytes", self.size);
+        eprintln!("Size (or pointer, if forwarded): {} bytes", self.size);
         self.mark_bit
     }
 
-    /// During a moving collection, overwrite the first word of the header (`size`) with a the new
-    /// address of this object in the mature space. Since pointers are at least 2-byte aligned, the
-    /// forwarding bit is zero, which distinguishes this block from an as-of-yet not moved block.
+    // Old doc
+    // During a moving collection, overwrite the first word of the header (`size`) with a the new
+    // address of this object in the mature space. Since pointers are at least 2-byte aligned, the
+    // forwarding bit is zero, which distinguishes this block from an as-of-yet not moved block.
+
+    /// Overwrite the `size` data with a forwarding address, and set the mark bit to `true`/`1`, to
+    /// indicate that this block has been moved already.
     pub fn forward(&mut self, new_ptr: GcPtr) {
         self.size = new_ptr.start.as_ptr() as usize;
-        self.mark_bit = false;
+        self.mark_bit = true;
     }
 
     /// Checks if this block has been moved already during a moving collection.
@@ -257,9 +273,10 @@ impl BlockHeader {
 
         unsafe {
             let self_ptr = self as *const BlockHeader;
-            let slot = align_up_cst(self_ptr.add(1).cast(), layout.align());
+            let slot = align_up_cst(self_ptr.wrapping_add(1).cast(), layout.align());
             assert!(layout.align() * size_of::<u8>() < (isize::MAX as usize));
-            let next_slot = align_up_cst(slot.add(layout.size()), align_of::<BlockHeader>());
+            let next_slot =
+                align_up_cst(slot.wrapping_add(layout.size()), align_of::<BlockHeader>());
 
             (next_slot as usize) <= (self_ptr as usize) + size_of::<BlockHeader>() + self.size
         }
@@ -1031,7 +1048,7 @@ unsafe fn align_up(ptr: *mut u8, align: usize) -> *mut u8 {
     // 2. Take the modulo `align` again to get exactly `align - remainder`
     // 3. Offset the ptr by this value
     let offset = ((!(ptr as usize) & (align - 1)) + 1) & (align - 1);
-    ptr.add(offset)
+    ptr.wrapping_add(offset)
 }
 
 unsafe fn align_up_cst(ptr: *const u8, align: usize) -> *const u8 {
@@ -1041,7 +1058,7 @@ unsafe fn align_up_cst(ptr: *const u8, align: usize) -> *const u8 {
     // 2. Take the modulo `align` again to get exactly `align - remainder`
     // 3. Offset the ptr by this value
     let offset = ((!(ptr as usize) & (align - 1)) + 1) & (align - 1);
-    ptr.add(offset)
+    ptr.wrapping_add(offset)
 }
 
 /// Unsafety: the preconditions to avoid Undefined Behavior are the same as for `std::ptr::add`.
@@ -1152,6 +1169,12 @@ impl MemoryManager {
 }
 
 impl<T> fmt::Pointer for Gc<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:p}", self.start)
+    }
+}
+
+impl fmt::Pointer for GcPtr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{:p}", self.start)
     }
