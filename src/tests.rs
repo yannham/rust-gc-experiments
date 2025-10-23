@@ -94,7 +94,7 @@ fn unroot_bulk(u: &mut Unstructured, manager: &mut MemoryManager) -> Result<(), 
 }
 
 #[test]
-fn all_numbers_are_even() {
+fn tree_one_round_manual_young_collect() {
     arbtest(|u| {
         let heap = Heap::new(SPACE_SIZE, SPACE_SIZE);
         let mut manager = MemoryManager::new();
@@ -102,6 +102,66 @@ fn all_numbers_are_even() {
         alloc_bulk(u, &heap, &mut manager)?;
         unroot_bulk(u, &mut manager)?;
         heap.collect_young(&mut manager);
+        Ok(())
+    });
+}
+
+#[test]
+fn tree_multi_rounds_manual_young_collect() {
+    arbtest(|u| {
+        let heap = Heap::new(SPACE_SIZE, SPACE_SIZE);
+        let mut manager = MemoryManager::new();
+
+        alloc_bulk(u, &heap, &mut manager)?;
+        unroot_bulk(u, &mut manager)?;
+        heap.collect_young(&mut manager);
+        alloc_bulk(u, &heap, &mut manager)?;
+        unroot_bulk(u, &mut manager)?;
+        heap.collect_young(&mut manager);
+        alloc_bulk(u, &heap, &mut manager)?;
+        unroot_bulk(u, &mut manager)?;
+        heap.collect_young(&mut manager);
+
+        Ok(())
+    });
+}
+
+#[test]
+fn tree_young_collecs() {
+    arbtest(|u| {
+        let heap = Heap::new(size_of::<ManagedObject>() * 5, SPACE_SIZE);
+        let mut manager = MemoryManager::new();
+
+        alloc_bulk(u, &heap, &mut manager)?;
+        unroot_bulk(u, &mut manager)?;
+
+        alloc_bulk(u, &heap, &mut manager)?;
+        unroot_bulk(u, &mut manager)?;
+
+        alloc_bulk(u, &heap, &mut manager)?;
+        unroot_bulk(u, &mut manager)?;
+
+        Ok(())
+    });
+}
+
+#[test]
+fn tree_young_collecs_and_mature() {
+    arbtest(|u| {
+        let heap = Heap::new(size_of::<ManagedObject>() * 5, SPACE_SIZE);
+        let mut manager = MemoryManager::new();
+
+        alloc_bulk(u, &heap, &mut manager)?;
+        unroot_bulk(u, &mut manager)?;
+
+        alloc_bulk(u, &heap, &mut manager)?;
+        unroot_bulk(u, &mut manager)?;
+
+        alloc_bulk(u, &heap, &mut manager)?;
+        unroot_bulk(u, &mut manager)?;
+
+        heap.collect_mature(&mut manager);
+
         Ok(())
     });
 }
