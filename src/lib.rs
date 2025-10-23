@@ -470,10 +470,13 @@ impl Heap {
                 continue;
             }
 
-            let header = unsafe { &mut *(root.as_ptr() as *mut BlockHeader) };
-
             debug_assert!(
-                !header.is_marked(),
+                unsafe {
+                    !(root.as_ptr() as *const BlockHeader)
+                        .as_ref()
+                        .unwrap()
+                        .is_marked()
+                },
                 "roots should always be unmarked at the beginning of the tracing phase"
             );
 
