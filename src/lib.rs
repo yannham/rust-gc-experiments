@@ -37,6 +37,9 @@ pub trait AllocSpace {
     /// Copy the content of an existing [GcPtr], potentially from a different space, to this space.
     /// This creates a new distinct [GcPtr].
     fn copy(&self, obj: GcPtr) -> GcPtr;
+
+    /// Checks if a pointer is contained in this space.
+    fn contains(&self, ptr: *const BlockHeader) -> bool;
 }
 
 impl TraceEntry {
@@ -82,6 +85,12 @@ impl TraceEntry {
 
         while let Some(TraceEntry { field }) = stack.pop() {
             let pointee = unsafe { *field };
+
+            if to_space.contains(pointee.as_ptr()) {
+                eprintln!("Entry {pointee:p} is already in the target space, skipping");
+                continue;
+            }
+
             eprintln!("Evacuate loop: processing {field:p} -> {pointee:p}");
 
             let forwarding_addr = unsafe {
@@ -736,6 +745,10 @@ impl AllocSpace for YoungSpace {
             }
         }
     }
+
+    fn contains(&self, ptr: *const BlockHeader) -> bool {
+        self.space.contains(ptr)
+    }
 }
 
 impl MatureSpace {
@@ -1013,6 +1026,10 @@ impl AllocSpace for MatureSpace {
 
             GcPtr { start: free_block }
         }
+    }
+
+    fn contains(&self, ptr: *const BlockHeader) -> bool {
+        self.space.contains(ptr)
     }
 }
 
