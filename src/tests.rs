@@ -46,12 +46,18 @@ impl ManagedObject {
         let children_count = u.int_in_range(0..=min(alloc_count, MAX_CHILDREN))?;
         let mut children = Vec::with_capacity(children_count);
 
+        // TODO: get rid of this collection. We need it as long as we haven't fix the issue of
+        // GcPtr taken in the for loop being invalidated later by `root` causing a collection when
+        // space is insufficient.
+        if !heap.can_alloc_young::<ManagedObject>() {
+            heap.collect_young(manager);
+        }
+
         let allocs: Vec<_> = manager.iter().collect();
 
         for _ in 0..children_count {
             // Safety: this is the safety precondition of this function.
             let child = unsafe { Gc::<ManagedObject>::from_gc_ptr(*u.choose(&allocs)?) };
-
             children.push(child);
         }
 
