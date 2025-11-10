@@ -751,6 +751,39 @@ impl AllocSpace for YoungSpace {
     }
 }
 
+// ALLOCATOR DESIGN
+//
+// 8/16/32: tiny allocations - separate allocation bitmap
+// We start with initial k pages for each. Request more pages to the OS as we go.
+//
+// a bunch of `n` pages for each size. If need more pages, we alloc them. we have a linked of
+// metadata for each page, which points back to the first byte of the page. Each page has also a
+// pointer back to the its metadata (could also fit the bitmap in the page, but beware of cache
+// associativity).
+//
+// Allocation path (for fixed-size classes):
+//  - find the right size class
+//  - find the first non-full page
+//  - find the first empty slot in the bitmap
+//  - alloc and return it
+//  - set the bit to 1
+//
+// On de-allocation:
+//  - find the page metadata from a pointer
+//  - set the bit in the bitmap to 0
+//  - if the page was full, put it at the end of the non-full list
+//  - if the page is empty, and the current number of allocated pages is > k + p, then return it
+//    to the OS
+//
+// Non-fixed size bucket: start with one big block, and split it in two each time. Keep the
+// available free blocks in a ordered tree. Find the best fit, remove it from the tree, and return
+// it.
+//
+// TODO: look at the bit/binary/buddy algorithm to recombine blocks. That would happen upon
+// freeing.
+//
+// The question of where to put the mark bit? Probably in a bitmap for fixed-size value, and in a
+// header maybe for others? Or all in bitmap?
 impl MatureSpace {
     pub fn new(size: usize) -> Self {
         let space = HeapSpace::new(size);
