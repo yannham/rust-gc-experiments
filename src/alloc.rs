@@ -3,9 +3,9 @@
 //! with this one, which is a more modern version with small fixed-size classes and an all-purpose
 //! best-fit one for bigger objects.
 
-use bitmaps::{Bitmap, Bits, BitsImpl};
+// use bitmaps::{Bitmap, Bits, BitsImpl};
 use memmap::{self, MmapMut};
-use std::{alloc::Layout, io};
+use std::{alloc::Layout, io, ptr::NonNull};
 
 // ALLOCATOR DESIGN
 //
@@ -41,31 +41,57 @@ use std::{alloc::Layout, io};
 // The question of where to put the mark bit? Probably in a bitmap for fixed-size value, and in a
 // header maybe for others? Or all in bitmap?
 
-const SMALL_CLASS_SIZES: [usize; 3] = [8, 16, 32];
 const PAGE_SIZE: usize = 4 * 1024;
 
 fn alloc_page() -> io::Result<MmapMut> {
     MmapMut::map_anon(PAGE_SIZE)
 }
 
-struct AllocBucket<const SIZE: usize>
-where
-    BitsImpl<{ SIZE }>: Bits,
+struct AllocBucket
 {
     pages: MmapMut,
-    allocated: Bitmap<SIZE>,
-    marked: Bitmap<SIZE>,
+    block_size: usize,
+    allocated: Bitmap,
+    marked: Bitmap,
+    next: Option<NonNull<AllocBucket>>,
+    prev: Option<NonNull<AllocBucket>>,
 }
 
-impl<const SIZE: usize> AllocBucket<SIZE>
-where
-    BitsImpl<{ SIZE }>: Bits,
+const fn bitmap_size(size: usize) -> usize {
+    PAGE_SIZE / size
+}
+
+struct Bitmap(Vec<bool>);
+
+impl Bitmap {
+    pub fn new(block_size: usize) -> Self {
+        todo!()
+    }
+
+    pub fn first_false_index(&self) -> Option<usize> {
+        todo!()
+    }
+
+    pub fn get(&self, index: usize) -> bool {
+        todo!()
+    }
+
+    pub fn set(&mut self, index: usize, bit: bool) {
+        todo!()
+    }
+}
+
+
+impl AllocBucket
 {
-    pub fn new() -> Self {
+    pub fn new(block_size: usize) -> Self {
         Self {
             pages: alloc_page().unwrap(),
-            allocated: Bitmap::new(),
-            marked: Bitmap::new(),
+            block_size,
+            allocated: Bitmap::new(block_size),
+            marked: Bitmap::new(block_size),
+            next: None,
+            prev: None,
         }
     }
 
@@ -87,7 +113,7 @@ where
         let slot_index = self.allocated.first_false_index()?;
 
         self.allocated.set(slot_index, true);
-        unsafe { Some(self.base_mut().add(slot_index * SIZE)) }
+        unsafe { Some(self.base_mut().add(slot_index * self.block_size)) }
     }
 
     pub fn free(&mut self, addr: *const u8) {
@@ -96,57 +122,40 @@ where
         unsafe {
             assert!(self.contains(addr), "error: tried to free an adress outside of the bucket ({addr:p}, bucket start: {base:p})");
         }
-        let slot_index = ((addr as usize) - (base as usize)) / SIZE;
+        let slot_index = ((addr as usize) - (base as usize)) / self.block_size;
 
         assert!(
             self.allocated.get(slot_index),
-            "error: double-free @ {addr:p} (class size {SIZE})"
+            "error: double-free @ {addr:p} (class size {})",
+            self.block_size
         );
 
         self.allocated.set(slot_index, false);
     }
 }
 
-const fn bitmap_size(obj_size: usize) -> usize {
-    PAGE_SIZE / obj_size
+struct Classes {
+    data: [NonNull<u8>; 9],
 }
 
 struct AllocState {
-    class8: AllocBucket<{ PAGE_SIZE / 8 }>,
-    class16: AllocBucket<{ PAGE_SIZE / 16 }>,
-    class32: AllocBucket<{ PAGE_SIZE / 32 }>,
+    buckets: [AllocBucket; 9],
 }
 
 impl AllocState {
     pub fn new() -> Self {
         Self {
-            class8: AllocBucket::new(),
-            class16: AllocBucket::new(),
-            class32: AllocBucket::new(),
+            buckets: std::array::from_fn(|index| {
+                AllocBucket::new(1 << (index + 3)) 
+            }),
         }
     }
 
     pub fn alloc(&mut self, layout: Layout) -> Option<*mut u8> {
-        if layout.size() <= 8 && layout.align() <= 8 {
-            self.class8.alloc()
-        } else if layout.size() <= 16 && layout.align() <= 16 {
-            self.class16.alloc()
-        } else if layout.size() <= 32 && layout.align() <= 32 {
-            self.class32.alloc()
-        } else {
-            todo!()
-        }
+        todo!() 
     }
 
     pub fn free(&mut self, addr: *const u8) {
-        if self.class8.contains(addr) {
-            self.class8.free(addr)
-        } else if self.class16.contains(addr) {
-            self.class16.free(addr)
-        } else if self.class32.contains(addr) {
-            self.class32.free(addr)
-        } else {
-            todo!()
-        }
+        todo!() 
     }
 }
