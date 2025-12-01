@@ -5,7 +5,7 @@
 
 // use bitmaps::{Bitmap, Bits, BitsImpl};
 use memmap::{self, MmapMut};
-use std::{alloc::Layout, io, ptr::NonNull};
+use std::{alloc::Layout, cmp::max, io, ptr::NonNull};
 
 // ALLOCATOR DESIGN
 //
@@ -47,14 +47,75 @@ fn alloc_page() -> io::Result<MmapMut> {
     MmapMut::map_anon(PAGE_SIZE)
 }
 
-struct AllocBucket
-{
+struct BucketList {
+    bucket: AllocBucket,
+    next: Option<NonNull<BucketList>>,
+    prev: Option<NonNull<BucketList>>,
+}
+
+impl BucketList {
+    pub fn new(bucket: AllocBucket) -> NonNull<Self> {
+        unsafe {
+            NonNull::new_unchecked(Box::into_raw(Box::new(Self {
+                bucket,
+                next: None,
+                prev: None,
+            })))
+        }
+    }
+
+    pub fn prepend(mut head: NonNull<BucketList>, bucket: AllocBucket) -> NonNull<Self> {
+        let bucket = Self {
+            bucket,
+            next: Some(head),
+            prev: None,
+        };
+
+        let new_node = unsafe { NonNull::new_unchecked(Box::into_raw(Box::new(bucket))) };
+
+        unsafe {
+            assert!(head.as_ref().prev.is_none());
+            head.as_mut().prev = Some(new_node);
+        }
+
+        new_node
+    }
+
+    pub fn alloc(head: NonNull<Self>) -> Option<*mut u8> {
+        let mut node = Self::find_first(head, |node| !node.bucket.is_full())?;
+        unsafe { node.as_mut().bucket.alloc() }
+    }
+
+    pub fn free(this: NonNull<Self>, addr: *const u8) {
+        //TODO: if we end up with an empty page, we probably want to either release it, or put it
+        //in front, etc.
+        let Some(mut node) = Self::find_first(this, |node| node.bucket.contains(addr)) else {
+            panic!("couldn't find address {addr:p} in its class size's buckets");
+        };
+        unsafe { node.as_mut().bucket.free(addr) }
+    }
+
+    pub fn find_first(
+        head: NonNull<Self>,
+        mut pred: impl FnMut(&BucketList) -> bool,
+    ) -> Option<NonNull<BucketList>> {
+        let mut curr = head;
+
+        unsafe {
+            while !pred(curr.as_ref()) {
+                curr = curr.as_ref().next?;
+            }
+        }
+
+        Some(curr)
+    }
+}
+
+struct AllocBucket {
     pages: MmapMut,
     block_size: usize,
     allocated: Bitmap,
     marked: Bitmap,
-    next: Option<NonNull<AllocBucket>>,
-    prev: Option<NonNull<AllocBucket>>,
 }
 
 const fn bitmap_size(size: usize) -> usize {
@@ -81,17 +142,13 @@ impl Bitmap {
     }
 }
 
-
-impl AllocBucket
-{
+impl AllocBucket {
     pub fn new(block_size: usize) -> Self {
         Self {
             pages: alloc_page().unwrap(),
             block_size,
             allocated: Bitmap::new(block_size),
             marked: Bitmap::new(block_size),
-            next: None,
-            prev: None,
         }
     }
 
@@ -132,6 +189,10 @@ impl AllocBucket
 
         self.allocated.set(slot_index, false);
     }
+
+    pub fn is_full(&self) -> bool {
+        self.allocated.0.iter().all(|bit| *bit)
+    }
 }
 
 struct Classes {
@@ -139,23 +200,48 @@ struct Classes {
 }
 
 struct AllocState {
-    buckets: [AllocBucket; 9],
+    buckets: [NonNull<BucketList>; 9],
 }
 
 impl AllocState {
     pub fn new() -> Self {
         Self {
             buckets: std::array::from_fn(|index| {
-                AllocBucket::new(1 << (index + 3)) 
+                BucketList::new(AllocBucket::new(1 << (index + 3)))
             }),
         }
     }
 
     pub fn alloc(&mut self, layout: Layout) -> Option<*mut u8> {
-        todo!() 
+        if let Some(idx) = Self::index(&layout) {
+            BucketList::alloc(self.buckets[idx]).or_else(|| {
+                let mut new_bucket = AllocBucket::new(1 << (idx + 3));
+                let alloced = new_bucket.alloc();
+                self.buckets[idx] = BucketList::prepend(self.buckets[idx], new_bucket);
+                alloced
+            })
+        } else {
+            todo!()
+        }
     }
 
-    pub fn free(&mut self, addr: *const u8) {
-        todo!() 
+    pub fn free(&mut self, addr: *const u8, layout: Layout) {
+        if let Some(idx) = Self::index(&layout) {
+            BucketList::free(self.buckets[idx], addr)
+        } else {
+            todo!()
+        }
+    }
+
+    fn index(layout: &Layout) -> Option<usize> {
+        let form_factor = max(layout.size(), layout.align());
+        let upper_bound = form_factor.next_power_of_two().ilog2() as usize;
+
+        // Small alloc are maxed at 2KB, which is `2^11`
+        if upper_bound > 11 {
+            None
+        } else {
+            Some(upper_bound.saturating_sub(3))
+        }
     }
 }
