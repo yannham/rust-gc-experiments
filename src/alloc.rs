@@ -5,7 +5,13 @@
 
 // use bitmaps::{Bitmap, Bits, BitsImpl};
 use memmap::{self, MmapMut};
-use std::{alloc::Layout, cmp::max, io, ptr::NonNull};
+use std::{
+    alloc::Layout,
+    cmp::max,
+    io,
+    mem::{self, ManuallyDrop},
+    ptr::NonNull,
+};
 
 // ALLOCATOR DESIGN
 //
@@ -40,6 +46,8 @@ use std::{alloc::Layout, cmp::max, io, ptr::NonNull};
 //
 // The question of where to put the mark bit? Probably in a bitmap for fixed-size value, and in a
 // header maybe for others? Or all in bitmap?
+//
+// TODO: why the interface of alloc is Option<*mut u8>?
 
 const PAGE_SIZE: usize = 4 * 1024;
 
@@ -89,6 +97,10 @@ impl BucketList {
     pub fn free(this: NonNull<Self>, addr: *const u8) {
         //TODO: if we end up with an empty page, we probably want to either release it, or put it
         //in front, etc.
+        //TODO: we have to search for the right page in the list. We could maybe find the address
+        //of the page directly from `addr` (easy), and have a way to go from a page addr to
+        //metadata addr (for example, write the address of the corresponding node in the first slot
+        //of the page)
         let Some(mut node) = Self::find_first(this, |node| node.bucket.contains(addr)) else {
             panic!("couldn't find address {addr:p} in its class size's buckets");
         };
@@ -195,8 +207,10 @@ impl AllocBucket {
     }
 }
 
-struct Classes {
-    data: [NonNull<u8>; 9],
+/// The header that we write at the beginning of a big allocation. Freeing is just dropping this
+/// header; the [Drop] implementation of [MmapMut] will return the pages to the OS.
+struct BigAllocHeader {
+    pages: MmapMut,
 }
 
 struct AllocState {
@@ -214,15 +228,42 @@ impl AllocState {
 
     pub fn alloc(&mut self, layout: Layout) -> Option<*mut u8> {
         if let Some(idx) = Self::index(&layout) {
-            BucketList::alloc(self.buckets[idx]).or_else(|| {
-                let mut new_bucket = AllocBucket::new(1 << (idx + 3));
-                let alloced = new_bucket.alloc();
-                self.buckets[idx] = BucketList::prepend(self.buckets[idx], new_bucket);
-                alloced
-            })
+            self.small_alloc(idx)
         } else {
-            todo!()
+            self.big_alloc(layout)
         }
+    }
+
+    pub fn small_alloc(&mut self, idx: usize) -> Option<*mut u8> {
+        BucketList::alloc(self.buckets[idx]).or_else(|| {
+            let mut new_bucket = AllocBucket::new(1 << (idx + 3));
+            let alloced = new_bucket.alloc();
+            self.buckets[idx] = BucketList::prepend(self.buckets[idx], new_bucket);
+            alloced
+        })
+    }
+
+    pub fn big_alloc(&mut self, layout: Layout) -> Option<*mut u8> {
+        assert!(layout.align() <= PAGE_SIZE);
+
+        // We write the `MmapMut` corresponding object at the end of the allocation, as raw bytes
+        // (in the sense that we will never materialize any reference to it in-place, so we don't
+        // have to care about alignement). When freeing, we reconstruct this object and simply drop
+        // it.
+        let total_size = layout.size() + mem::size_of::<MmapMut>();
+        let mut pages = ManuallyDrop::new(MmapMut::map_anon(total_size).ok()?);
+        unsafe {
+            pages
+                .as_mut_ptr()
+                // SAFETY:
+                .add(layout.size())
+                .copy_from_nonoverlapping(
+                    &pages as *const _ as *const u8,
+                    mem::size_of::<MmapMut>(),
+                );
+        }
+
+        Some(pages.as_mut_ptr())
     }
 
     pub fn free(&mut self, addr: *const u8, layout: Layout) {
