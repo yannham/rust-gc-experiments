@@ -210,7 +210,7 @@ struct BigAllocHeader {
     pages: MmapMut,
 }
 
-struct AllocState {
+pub struct AllocState {
     buckets: [NonNull<BucketList>; 9],
 }
 

@@ -1,15 +1,17 @@
-use std::alloc::{alloc, Layout};
-use std::cell::Cell;
+use std::alloc::{Layout, alloc};
+use std::cell::{Cell, RefCell};
 use std::fmt;
 use std::marker::PhantomData;
 use std::mem::align_of;
 use std::ops::Deref;
 use std::ptr::{self, NonNull};
+use std::cmp::max;
 
 #[cfg(test)]
 mod tests;
-
 mod alloc;
+
+use alloc::AllocState;
 
 /// The garbage-collected heap.
 pub struct Heap {
@@ -518,9 +520,7 @@ pub struct YoungSpace {
 }
 
 pub struct MatureSpace {
-    space: HeapSpace,
-    /// The head of the free list of blocks in this space.
-    next_free: Cell<Option<NonNull<BlockHeader>>>,
+    space: RefCell<AllocState>,
 }
 
 impl HeapSpace {
@@ -533,7 +533,7 @@ impl HeapSpace {
             let start = alloc(Layout::from_size_align(size, align_of::<BlockHeader>()).unwrap());
 
             let Some(start) = NonNull::new(start) else {
-                panic!("out of memory");
+                panic!("out of memory")
             };
 
             if size >= (isize::MAX as usize) {
@@ -754,161 +754,23 @@ impl AllocSpace for YoungSpace {
 }
 
 impl MatureSpace {
-    pub fn new(size: usize) -> Self {
-        let space = HeapSpace::new(size);
-
-        unsafe {
-            Self::write_free_block(space.start.cast(), size, None);
-        }
-
+    pub fn new(_size: usize) -> Self {
         MatureSpace {
-            next_free: Cell::new(Some(space.start.cast())),
-            space,
-        }
-    }
-
-    /// TODO doc
-    ///
-    /// # Safety
-    ///
-    /// - `start` is valid, non-null pointer that can be written to
-    unsafe fn write_free_block(
-        start: NonNull<BlockHeader>,
-        size: usize,
-        next: Option<NonNull<BlockHeader>>,
-    ) {
-        start.write(BlockHeader::empty(size, next));
-    }
-
-    /// Picks a free block large enough to store a value with a given layout and removes it from
-    /// the free list block.
-    fn find_fitting_block(&self, layout: Layout) -> Option<NonNull<BlockHeader>> {
-        let mut prev: Option<NonNull<BlockHeader>> = None;
-        let mut cursor = self.next_free.get();
-
-        while let Some(curr) = cursor {
-            unsafe {
-                let header = curr.as_ref();
-                let BlockType::Free { next } = header.block_type else {
-                    unreachable!()
-                };
-
-                if header.can_store(layout) {
-                    if let Some(mut prev) = prev {
-                        prev.as_mut().block_type = BlockType::Free { next };
-                    } else {
-                        self.next_free.set(next);
-                    }
-
-                    return cursor;
-                }
-
-                prev = cursor;
-                cursor = next;
-            }
-        }
-
-        None
-    }
-
-    fn split_block<T: Trace>(&self, free_block: NonNull<BlockHeader>) {
-        self.split_block_untyped(free_block, Layout::new::<T>(), T::trace_untyped)
-    }
-
-    /// Splits a free block in two parts, with the first part being large enough to accomodate for
-    /// the required data. The leftover is added back to the beginning of the free block list. If
-    /// this function succeeds, the block header at `free_block` is updated with new type, padding
-    /// and size information. If there's no leftover or not enough to write a proper block header,
-    /// no second block is created at all.
-    ///
-    /// # Panic
-    ///
-    /// Panics if the free block isn't large enough to allocate a value of size `size`.
-    fn split_block_untyped(
-        &self,
-        free_block: NonNull<BlockHeader>,
-        layout: Layout,
-        tracer: Tracer,
-    ) {
-        unsafe {
-            let size = { free_block.as_ref().size };
-            assert!(free_block.as_ref().can_store(layout));
-
-            let unaligned_slot = free_block.as_ptr().add(1);
-            let slot = align_up(unaligned_slot.cast(), layout.align());
-            assert!(layout.align() < (isize::MAX as usize));
-            let next_header = align_up(slot.add(layout.size()), align_of::<BlockHeader>());
-
-            let left_size = (next_header as usize) - (unaligned_slot as usize);
-
-            let leftover = size + (free_block.as_ptr() as usize) + size_of::<BlockHeader>()
-                - next_header as usize;
-
-            eprintln!("split_block()\n** free_block = {free_block:p}, unaligned_slot = {unaligned_slot:p}, slot = {slot:p}, next_header = {next_header:p}");
-            eprintln!("** left_size = {left_size}, leftover = {leftover}");
-
-            // If the left-over is too small to make a proper block out of it (we need to write at
-            // least a header and have at least a byte to store data), we need to put those bytes
-            // back in the to-be-allocated block (in the padding).
-            let inner_fragmentation = if leftover >= size_of::<BlockHeader>() + 1 {
-                let right_header =
-                    BlockHeader::empty(leftover - size_of::<BlockHeader>(), self.next_free.get());
-                let right_header_slot = next_header as *mut BlockHeader;
-                right_header_slot.write(right_header);
-                self.next_free
-                    .set(Some(NonNull::new_unchecked(next_header.cast())));
-
-                eprintln!(
-                    "split_block(): split off chunk {:p}: {:?}",
-                    self.next_free.get().unwrap(),
-                    self.next_free.get().unwrap().as_ref()
-                );
-                0
-            } else {
-                eprintln!("split_block(): leftover too small to make a block ({leftover}), putting it back in");
-                leftover
-            };
-
-            let left_header = free_block.as_ptr();
-
-            ptr::write(
-                left_header,
-                BlockHeader::new(
-                    left_size + inner_fragmentation,
-                    layout.align(),
-                    (slot as usize) - (unaligned_slot as usize),
-                    (next_header as usize) - (slot as usize + layout.size()) + inner_fragmentation,
-                    tracer,
-                ),
-            );
+            //TODO: heap limit to trigger allocation, or a way to measure (an approx of) current
+            //allocations
+            space: RefCell::new(AllocState::new()),
         }
     }
 
     /// Allocates an object in this space, or returns `None` if the space is full.
     pub fn alloc<T: Trace>(&self, data: T) -> Gc<T> {
-        let Some(free_block) = self.find_fitting_block(Layout::new::<T>()) else {
-            todo!("no space left; trigger a GC");
-        };
-
-        eprintln!(
-            "alloc(): splitting block at {free_block:p} of size {}",
-            unsafe { free_block.as_ref().size }
-        );
-        self.split_block::<T>(free_block);
-        eprintln!("alloc(): block after splitting {:?}", unsafe {
-            free_block.as_ref()
-        });
-
         unsafe {
-            let align = Layout::new::<T>().align();
-            let unaligned_slot = free_block.as_ptr().add(1).cast();
-            assert!(align * size_of::<u8>() < (isize::MAX as usize));
-            let slot = align_up(unaligned_slot, align);
-
-            ptr::write(slot as *mut T, data);
+            let align = max(align_of::<BlockHeader>(), align_of::<T>());
+            let padding = size_of::<BlockHeader>().next_multiple_of(align_of::<T>()) - size_of::<BlockHeader>();
+            let mut size = size_of::<BlockHeader>() + size_of::<T>() + padding; 
 
             Gc {
-                start: free_block,
+                start: self.space.borrow_mut().alloc().unwrap(),
                 _marker: PhantomData,
             }
         }
@@ -1059,7 +921,8 @@ impl std::iter::Iterator for HeapSpaceIter {
     }
 }
 
-/// Unsafety: the preconditions to avoid Undefined Behavior are the same as for `std::ptr::add`.
+/// Unsafety: the preconditions to avoid Undefined Behavior are the same as for
+/// `std::ptr::wrapping_add`.
 /// This methods keeps the address provenance information.
 ///
 /// Requires that `align` is a power of 2.
