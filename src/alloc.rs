@@ -10,7 +10,7 @@ use std::{
     cmp::max,
     io,
     mem::{self, ManuallyDrop},
-    ptr::NonNull,
+    ptr::{self, NonNull},
 };
 
 // ALLOCATOR DESIGN
@@ -89,7 +89,7 @@ impl BucketList {
         new_node
     }
 
-    pub fn alloc(head: NonNull<Self>) -> Option<*mut u8> {
+    pub fn alloc(head: NonNull<Self>) -> Option<NonNull<u8>> {
         let mut node = Self::find_first(head, |node| !node.bucket.is_full())?;
         unsafe { node.as_mut().bucket.alloc() }
     }
@@ -138,19 +138,19 @@ struct Bitmap(Vec<bool>);
 
 impl Bitmap {
     pub fn new(block_size: usize) -> Self {
-        todo!()
+        Bitmap(vec![false; block_size])
     }
 
     pub fn first_false_index(&self) -> Option<usize> {
-        todo!()
+        self.0.iter().position(|b| !*b)
     }
 
     pub fn get(&self, index: usize) -> bool {
-        todo!()
+        self.0[index]
     }
 
     pub fn set(&mut self, index: usize, bit: bool) {
-        todo!()
+        self.0[index] = bit
     }
 }
 
@@ -164,8 +164,8 @@ impl AllocBucket {
         }
     }
 
-    fn base_mut(&mut self) -> *mut u8 {
-        self.pages.as_mut_ptr()
+    fn base_mut(&mut self) -> NonNull<u8> {
+        unsafe { NonNull::new_unchecked(self.pages.as_mut_ptr()) }
     }
 
     fn base(&self) -> *const u8 {
@@ -173,12 +173,11 @@ impl AllocBucket {
     }
 
     pub fn contains(&self, addr: *const u8) -> bool {
-        let base = self.base() as *const u8;
-        // Safety: TODO
-        unsafe { base < addr && addr < base.add(PAGE_SIZE) }
+        let base = self.base();
+        base < addr && addr < base.wrapping_add(PAGE_SIZE)
     }
 
-    pub fn alloc(&mut self) -> Option<*mut u8> {
+    pub fn alloc(&mut self) -> Option<NonNull<u8>> {
         let slot_index = self.allocated.first_false_index()?;
 
         self.allocated.set(slot_index, true);
@@ -188,9 +187,7 @@ impl AllocBucket {
     pub fn free(&mut self, addr: *const u8) {
         let base = self.base();
 
-        unsafe {
-            assert!(self.contains(addr), "error: tried to free an adress outside of the bucket ({addr:p}, bucket start: {base:p})");
-        }
+        assert!(self.contains(addr), "error: tried to free an adress outside of the bucket ({addr:p}, bucket start: {base:p})");
         let slot_index = ((addr as usize) - (base as usize)) / self.block_size;
 
         assert!(
@@ -226,7 +223,7 @@ impl AllocState {
         }
     }
 
-    pub fn alloc(&mut self, layout: Layout) -> Option<*mut u8> {
+    pub fn alloc(&mut self, layout: Layout) -> Option<NonNull<u8>> {
         if let Some(idx) = Self::index(&layout) {
             self.small_alloc(idx)
         } else {
@@ -234,7 +231,7 @@ impl AllocState {
         }
     }
 
-    pub fn small_alloc(&mut self, idx: usize) -> Option<*mut u8> {
+    pub fn small_alloc(&mut self, idx: usize) -> Option<NonNull<u8>> {
         BucketList::alloc(self.buckets[idx]).or_else(|| {
             let mut new_bucket = AllocBucket::new(1 << (idx + 3));
             let alloced = new_bucket.alloc();
@@ -243,7 +240,7 @@ impl AllocState {
         })
     }
 
-    pub fn big_alloc(&mut self, layout: Layout) -> Option<*mut u8> {
+    pub fn big_alloc(&mut self, layout: Layout) -> Option<NonNull<u8>> {
         assert!(layout.align() <= PAGE_SIZE);
 
         // We write the `MmapMut` corresponding object at the end of the allocation, as raw bytes
@@ -261,16 +258,33 @@ impl AllocState {
                     &pages as *const _ as *const u8,
                     mem::size_of::<MmapMut>(),
                 );
-        }
 
-        Some(pages.as_mut_ptr())
+            //SAFETY: an mmaped region is never null
+            Some(NonNull::new_unchecked(pages.as_mut_ptr()))
+        }
     }
 
     pub fn free(&mut self, addr: *const u8, layout: Layout) {
         if let Some(idx) = Self::index(&layout) {
             BucketList::free(self.buckets[idx], addr)
         } else {
-            todo!()
+            self.free_big(addr, layout);
+        }
+    }
+
+    fn free_big(&mut self, addr: *const u8, layout: Layout) {
+        let mut pages: mem::MaybeUninit<MmapMut> = mem::MaybeUninit::uninit();
+        // SAFETY: for big allocation, we add a raw copy of the MmapMut object at the end of
+        // the allocation
+        unsafe {
+            ptr::copy_nonoverlapping(
+                addr.add(layout.size()),
+                pages.as_mut_ptr() as *mut u8,
+                mem::size_of::<MmapMut>(),
+            );
+
+            // Just drop the mmap mut will run the destructor and return the pages to the OS
+            pages.assume_init();
         }
     }
 
