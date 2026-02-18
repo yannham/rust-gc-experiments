@@ -103,7 +103,10 @@ fn main() {
 
     let bar_after_collect = manager.get(bar_idx);
     let foo_after_collect = manager.get(foo_struct_idx);
-    eprintln!("Alive data pointers after moving: {bar_after_collect:p}, {baz_deps_after_collect:p}, {foo_after_collect:p}", baz_deps_after_collect = foo_after_collect.thd);
+    eprintln!(
+        "Alive data pointers after moving: {bar_after_collect:p}, {baz_deps_after_collect:p}, {foo_after_collect:p}",
+        baz_deps_after_collect = foo_after_collect.thd
+    );
     eprintln!("Alive data after moving: {bar_after_collect:?}, and {foo_after_collect:?}");
 
     manager.unroot(foo_struct_idx);

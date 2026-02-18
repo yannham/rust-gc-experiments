@@ -187,7 +187,10 @@ impl AllocBucket {
     pub fn free(&mut self, addr: *const u8) {
         let base = self.base();
 
-        assert!(self.contains(addr), "error: tried to free an adress outside of the bucket ({addr:p}, bucket start: {base:p})");
+        assert!(
+            self.contains(addr),
+            "error: tried to free an adress outside of the bucket ({addr:p}, bucket start: {base:p})"
+        );
         let slot_index = ((addr as usize) - (base as usize)) / self.block_size;
 
         assert!(
@@ -240,6 +243,8 @@ impl AllocState {
         })
     }
 
+    //TODO: we can't just forget about big allocations, because we need to sweep them later! So we
+    //probably have to keep a list of live big allocations.
     pub fn big_alloc(&mut self, layout: Layout) -> Option<NonNull<u8>> {
         assert!(layout.align() <= PAGE_SIZE);
 
