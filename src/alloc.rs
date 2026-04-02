@@ -4,6 +4,7 @@
 //! best-fit one for bigger objects.
 
 // use bitmaps::{Bitmap, Bits, BitsImpl};
+use crate::PhantomData;
 use memmap::{self, MmapMut};
 use std::{
     alloc::Layout,
@@ -72,6 +73,13 @@ impl BucketList {
         }
     }
 
+    pub fn iter_buckets_mut(&mut self) -> impl Iterator<Item = &mut AllocBucket> + '_ {
+        BucketListIterator {
+            next: Some(NonNull::from_ref(self)),
+            phantom: PhantomData,
+        }
+    }
+
     pub fn prepend(mut head: NonNull<BucketList>, bucket: AllocBucket) -> NonNull<Self> {
         let bucket = Self {
             bucket,
@@ -123,11 +131,44 @@ impl BucketList {
     }
 }
 
+struct BucketListIterator<'a> {
+    next: Option<NonNull<BucketList>>,
+    phantom: PhantomData<&'a BucketList>,
+}
+
+impl<'a> Iterator for BucketListIterator<'a> {
+    type Item = &'a mut AllocBucket;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let curr = unsafe { self.next?.as_mut() };
+        self.next = curr.next;
+
+        Some(&mut curr.bucket)
+    }
+}
+
 struct AllocBucket {
     pages: MmapMut,
     block_size: usize,
     allocated: Bitmap,
-    marked: Bitmap,
+    // At some point we might want header-less, and separate the allocator data structure from
+    // user-data. But for now we have a header with a mark bit, so it's a bit stupid to duplicate
+    // this here.
+    // marked: Bitmap,
+}
+
+impl AllocBucket {
+    pub fn iter_blocks_mut(&mut self) -> impl Iterator<Item = NonNull<u8>> + '_ {
+        self.allocated
+            .0
+            .iter()
+            .enumerate()
+            .filter_map(|(i, alloced)| alloced.then_some(i))
+            // SAFETY: all addresses in the mmaped page are non-null.
+            .map(|i| unsafe {
+                NonNull::new_unchecked(self.pages.as_mut_ptr().add(i * self.block_size))
+            })
+    }
 }
 
 const fn bitmap_size(size: usize) -> usize {
@@ -160,7 +201,7 @@ impl AllocBucket {
             pages: alloc_page().unwrap(),
             block_size,
             allocated: Bitmap::new(block_size),
-            marked: Bitmap::new(block_size),
+            // marked: Bitmap::new(block_size),
         }
     }
 
@@ -209,21 +250,31 @@ impl AllocBucket {
 
 /// The header that we write at the beginning of a big allocation. Freeing is just dropping this
 /// header; the [Drop] implementation of [MmapMut] will return the pages to the OS.
-struct BigAllocHeader {
+struct BigAllocFooter {
     pages: MmapMut,
 }
 
-pub struct AllocState {
+pub struct Alloc {
     buckets: [NonNull<BucketList>; 9],
+    big_allocs: Vec<NonNull<u8>>,
 }
 
-impl AllocState {
+impl Alloc {
     pub fn new() -> Self {
         Self {
+            big_allocs: Vec::new(),
             buckets: std::array::from_fn(|index| {
                 BucketList::new(AllocBucket::new(1 << (index + 3)))
             }),
         }
+    }
+
+    pub fn iter_blocks_mut(&mut self) -> impl Iterator<Item = NonNull<u8>> + '_ {
+        self.buckets
+            .iter_mut()
+            .flat_map(|bucket_list| unsafe { bucket_list.as_mut() }.iter_buckets_mut())
+            .flat_map(|bucket| bucket.iter_blocks_mut())
+            .chain(self.big_allocs.iter().copied())
     }
 
     pub fn alloc(&mut self, layout: Layout) -> Option<NonNull<u8>> {
@@ -243,30 +294,34 @@ impl AllocState {
         })
     }
 
-    //TODO: we can't just forget about big allocations, because we need to sweep them later! So we
-    //probably have to keep a list of live big allocations.
     pub fn big_alloc(&mut self, layout: Layout) -> Option<NonNull<u8>> {
         assert!(layout.align() <= PAGE_SIZE);
 
-        // We write the `MmapMut` corresponding object at the end of the allocation, as raw bytes
+        // We write the `BigAllocFooter` corresponding object at the end of the allocation, as raw bytes
         // (in the sense that we will never materialize any reference to it in-place, so we don't
         // have to care about alignement). When freeing, we reconstruct this object and simply drop
         // it.
-        let total_size = layout.size() + mem::size_of::<MmapMut>();
-        let mut pages = ManuallyDrop::new(MmapMut::map_anon(total_size).ok()?);
-        unsafe {
-            pages
+        let total_size = layout.size() + mem::size_of::<BigAllocFooter>();
+        let mut footer = ManuallyDrop::new(BigAllocFooter {
+            pages: MmapMut::map_anon(total_size).ok()?,
+        });
+        let addr = unsafe {
+            footer
+                .pages
                 .as_mut_ptr()
                 // SAFETY:
                 .add(layout.size())
                 .copy_from_nonoverlapping(
-                    &pages as *const _ as *const u8,
-                    mem::size_of::<MmapMut>(),
+                    &footer as *const _ as *const u8,
+                    mem::size_of::<BigAllocFooter>(),
                 );
 
             //SAFETY: an mmaped region is never null
-            Some(NonNull::new_unchecked(pages.as_mut_ptr()))
-        }
+            NonNull::new_unchecked(footer.pages.as_mut_ptr())
+        };
+
+        self.big_allocs.push(addr);
+        Some(addr)
     }
 
     pub fn free(&mut self, addr: *const u8, layout: Layout) {
@@ -278,14 +333,16 @@ impl AllocState {
     }
 
     fn free_big(&mut self, addr: *const u8, layout: Layout) {
-        let mut pages: mem::MaybeUninit<MmapMut> = mem::MaybeUninit::uninit();
+        self.big_allocs
+            .retain(|ptr| ptr.as_ptr() as *const u8 != addr);
+        let mut pages: mem::MaybeUninit<BigAllocFooter> = mem::MaybeUninit::uninit();
         // SAFETY: for big allocation, we add a raw copy of the MmapMut object at the end of
         // the allocation
         unsafe {
             ptr::copy_nonoverlapping(
                 addr.add(layout.size()),
                 pages.as_mut_ptr() as *mut u8,
-                mem::size_of::<MmapMut>(),
+                mem::size_of::<BigAllocFooter>(),
             );
 
             // Just drop the mmap mut will run the destructor and return the pages to the OS

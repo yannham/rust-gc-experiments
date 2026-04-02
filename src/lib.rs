@@ -11,7 +11,7 @@ mod alloc;
 #[cfg(test)]
 mod tests;
 
-use alloc::AllocState;
+use alloc::Alloc;
 
 /// The garbage-collected heap.
 pub struct Heap {
@@ -84,13 +84,13 @@ impl TraceEntry {
     /// # Safety
     ///
     /// `self.field` must be a valid, writable pointer to a [GcPtr].
-    pub fn evacuate(self, to_space: &impl AllocSpace) {
+    pub fn evacuate(self, from_space: &impl AllocSpace, to_space: &impl AllocSpace) {
         let mut stack = vec![self];
 
         while let Some(TraceEntry { field }) = stack.pop() {
             let pointee = unsafe { *field };
 
-            if to_space.contains(pointee.as_ptr()) {
+            if !from_space.contains(pointee.as_ptr()) {
                 eprintln!("Entry {pointee:p} is already in the target space, skipping");
                 continue;
             }
@@ -109,7 +109,7 @@ impl TraceEntry {
             let new_addr = forwarding_addr.unwrap_or_else(|| unsafe {
                 let to_addr = to_space
                     .copy(GcPtr { start: pointee })
-                    .expect("mature space is full during evacuatino. Todo: we should collect instead of panicking");
+                    .expect("mature space is full during evacuation. Todo: we should collect instead of panicking");
                 {
                     let from_header = &mut (*pointee.as_ptr());
                     from_header.forward(to_addr);
@@ -139,6 +139,7 @@ fn noop_tracer(_: *mut u8, _: &mut Vec<TraceEntry>) {}
 
 /// The two type of blocks (free or allocated). For free blocks, we include there the additional
 /// data of the next free block in the list, if any.
+// TODO: Scrap free blocks now that we switched to the allocator
 #[derive(Debug)]
 pub enum BlockType {
     Allocated,
@@ -497,7 +498,7 @@ impl Heap {
                 "roots should always be unmarked at the beginning of the tracing phase"
             );
 
-            entry.evacuate(&self.mature_space);
+            entry.evacuate(&self.young_space, &self.mature_space);
             eprintln!(
                 "Moved root {root:p} -> {dst:p}",
                 dst = unsafe { *entry.field }
@@ -513,7 +514,13 @@ impl Heap {
     }
 
     pub fn parse_mature(&self) {
-        eprintln!("parse is temporarily disabled on the mature space; todo");
+        for ptr in self.mature_space.space.borrow_mut().iter_blocks_mut() {
+            let header = unsafe { ptr.cast::<BlockHeader>().as_ref() };
+            println!(
+                "Next object: {} bytes (header @ {ptr:p}), type: {:?}",
+                header.size, header.block_type
+            );
+        }
     }
 }
 
@@ -524,7 +531,7 @@ pub struct YoungSpace {
 }
 
 pub struct MatureSpace {
-    space: RefCell<AllocState>,
+    space: RefCell<Alloc>,
 }
 
 impl HeapSpace {
@@ -762,7 +769,7 @@ impl MatureSpace {
         MatureSpace {
             //TODO: heap limit to trigger allocation, or a way to measure (an approx of) current
             //allocations
-            space: RefCell::new(AllocState::new()),
+            space: RefCell::new(Alloc::new()),
         }
     }
 
@@ -852,15 +859,20 @@ impl MatureSpace {
     /// Marking phase of the mark and sweep algorithm. `stack` is providing the list of roots
     /// through [MemoryManager].
     fn mark(&self, stack: &mut MemoryManager) {
+        #[cfg(debug_assertions)]
         for entry in stack.iter_mut_as_trace_entries() {
             let root = unsafe { *entry.field };
-            eprintln!("Tracing root {root:p}");
-
             let header = unsafe { &mut *(root.as_ptr() as *mut BlockHeader) };
+
             debug_assert!(
                 !header.is_marked(),
                 "roots should always be unmarked at the beginning of the tracing phase"
             );
+        }
+
+        for entry in stack.iter_mut_as_trace_entries() {
+            let root = unsafe { *entry.field };
+            eprintln!("Tracing root {root:p}");
             // Safety: `gc_ptr` is a valid GcPtr created from a mutable reference (that isn't used
             // anymore).
             unsafe { entry.mark() }
@@ -870,26 +882,26 @@ impl MatureSpace {
     /// Sweeping phase of the mark and sweep algorithm. Free all unmarked blocks, and unmark
     /// previously marked blocks, preparing for the next collection.
     pub fn sweep(&self) {
-        let mut ptr = self.space.start.as_ptr();
-        let end = self.space.end();
+        let mut space = self.space.borrow_mut();
+        // This is stupid for now, but iterating borrow the space mutably, so we can't free as we
+        // go. We collect the addresses and free them all at once at the end.
+        let mut to_free = Vec::new();
 
-        unsafe {
-            while ptr < end {
-                // unwrap(): No pointer in the range [start, end] is null
-                let header = ptr.cast::<BlockHeader>().as_mut().unwrap();
-                if header.is_marked() {
-                    println!("Object {ptr:p} is marked. Keeping and unmarking");
-                    header.unmark();
-                }
-                // We must be aware of not freeing already free blocks, which would corrupt the
-                // free block list.
-                else if matches!(header.block_type, BlockType::Allocated { .. }) {
-                    self.free(header.into());
-                }
+        for ptr in space.iter_blocks_mut() {
+            let header = unsafe { ptr.cast::<BlockHeader>().as_mut() };
+            println!("Next object: {} bytes (header @ {ptr:p})", header.size);
 
-                println!("Next object: {} bytes (header @ {ptr:p})", header.size);
-                ptr = ptr.wrapping_add(header.size + size_of::<BlockHeader>());
+            if header.is_marked() {
+                println!("Object {ptr:p} is marked. Keeping and unmarking");
+                header.unmark();
+            } else {
+                to_free.push((ptr.as_ptr(), header.layout().unwrap()));
             }
+        }
+
+        for (addr, layout) in to_free {
+            eprintln!("Sweep: freeing {addr:p} with layout {layout:?}");
+            space.free(addr, layout);
         }
     }
 
@@ -922,6 +934,7 @@ impl AllocSpace for MatureSpace {
         //     free_block.as_ref()
         // });
 
+        eprintln!("Calling pre-alloc with layout {layout:?}");
         let gc_ptr = self.prealloc(layout, tracer)?;
 
         unsafe {
